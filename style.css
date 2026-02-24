@@ -155,6 +155,11 @@ body {
 #res-power-fill { background: linear-gradient(90deg, #4A90D9, #68B8FF); }
 #res-material-fill { background: linear-gradient(90deg, #8B7355, #B89A6A); }
 
+.res-bar-item-medkit .res-bar-val {
+    color: #6BC98A;
+    min-width: 16px;
+}
+
 .res-bar-val {
     font-size: 12px;
     font-weight: 600;

@@ -5,7 +5,7 @@
     <em>An AI-driven pixel-art survival simulation where 8 autonomous NPCs fight to survive a 4-day apocalyptic blizzard — powered by LLM reasoning.</em>
   </p>
   <p align="center">
-    <a href="README_CN.md">中文文档</a> · 
+    <a href="./README_CN.md">中文文档</a> · 
     <a href="#quick-start">Quick Start</a> · 
     <a href="#features">Features</a> ·
     <a href="#architecture">Architecture</a>

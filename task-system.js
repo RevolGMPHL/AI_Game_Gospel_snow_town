@@ -768,6 +768,25 @@ class TaskSystem {
             task.startTime = Date.now();
         }
 
+        // 【修复】任务效果位置校验：NPC必须在任务指定的正确场景才能产出
+        const taskDetail = TASK_DETAILS[task.type];
+        if (taskDetail && taskDetail.targetLocation) {
+            const doorToScene = {
+                warehouse_door: 'warehouse', medical_door: 'medical',
+                dorm_a_door: 'dorm_a', dorm_b_door: 'dorm_b',
+                kitchen_door: 'kitchen', workshop_door: 'workshop',
+            };
+            const tLoc = taskDetail.targetLocation;
+            const isDoor = tLoc.endsWith('_door');
+            // _door类型任务：NPC必须在对应室内场景
+            // 户外类型任务：NPC必须在village场景
+            const requiredScene = isDoor ? doorToScene[tLoc] : 'village';
+            if (requiredScene && npc.currentScene !== requiredScene) {
+                // NPC不在正确位置，不产出但也不暂停（让NPC导航系统去纠正）
+                return;
+            }
+        }
+
         state.workTime += dt;
 
         // 计算效率倍率
@@ -1347,6 +1366,45 @@ class TaskSystem {
         return `任务${completed}/${total}完成 | ${inProgress}进行中 | ${paused}暂停`;
     }
 
+    /**
+     * 获取指定NPC当前分配的未完成任务（供NPC._executeAction的case 'work'调用）
+     * @param {string} npcId - NPC的id
+     * @returns {{ type: string, desc: string, targetLocation: string } | null}
+     */
+    getCurrentTask(npcId) {
+        if (!npcId) return null;
+        // 优先查找该NPC被分配的任务ID
+        const taskId = this.npcAssignments[npcId];
+        if (taskId) {
+            const task = this.dailyTasks.find(t => t.id === taskId && t.status !== 'completed');
+            if (task) {
+                const details = TASK_DETAILS[task.type];
+                if (details) {
+                    return {
+                        type: task.type,
+                        desc: details.desc || task.desc || task.name,
+                        targetLocation: details.targetLocation || null,
+                    };
+                }
+            }
+        }
+        // 没有通过npcAssignments分配的任务，遍历dailyTasks找assignedNpcId匹配的
+        const assignedTask = this.dailyTasks.find(t =>
+            t.assignedNpcId === npcId && t.status !== 'completed'
+        );
+        if (assignedTask) {
+            const details = TASK_DETAILS[assignedTask.type];
+            if (details) {
+                return {
+                    type: assignedTask.type,
+                    desc: details.desc || assignedTask.desc || assignedTask.name,
+                    targetLocation: details.targetLocation || null,
+                };
+            }
+        }
+        return null;
+    }
+
     // ============ 日志 ============
 
     /** 记录未完成任务 */
@@ -1522,13 +1580,21 @@ urgentNeeds.push({ resourceType: 'food', taskType: TASK_TYPES.COLLECT_FOOD, targ
 
             if (candidates.length === 0) continue;
 
-            // 按专长匹配度 + 体力排序
+            // 【增强】按专长匹配度排序，排除老钱（优先安抚），相同专长按体力排序
             candidates.sort((a, b) => {
+                // 老钱优先安抚，排到最后（除非没有其他人可用）
+                const aIsQian = a.id === 'old_qian' ? 1 : 0;
+                const bIsQian = b.id === 'old_qian' ? 1 : 0;
+                if (aIsQian !== bIsQian) return aIsQian - bIsQian;
+
                 const specA = NPC_SPECIALTIES[a.id];
                 const specB = NPC_SPECIALTIES[b.id];
-                const scoreA = (specA && specA.bonuses && specA.bonuses[need.taskType] || 1) * a.stamina;
-                const scoreB = (specB && specB.bonuses && specB.bonuses[need.taskType] || 1) * b.stamina;
-                return scoreB - scoreA;
+                const multA = (specA && specA.bonuses && specA.bonuses[need.taskType]) || 1.0;
+                const multB = (specB && specB.bonuses && specB.bonuses[need.taskType]) || 1.0;
+                // 优先选专长倍率高的
+                if (multA !== multB) return multB - multA;
+                // 相同专长倍率按体力排序
+                return b.stamina - a.stamina;
             });
 
             // 分配最优NPC
@@ -1544,7 +1610,10 @@ urgentNeeds.push({ resourceType: 'food', taskType: TASK_TYPES.COLLECT_FOOD, targ
 
                 if (this.game.addEvent) {
                     const resourceNames = { woodFuel: '砍柴', food: '采集食物', power: '维护电力' };
-                    this.game.addEvent(`🚨 资源紧急！${npc.name}被自动分配前往${resourceNames[need.resourceType]}！`);
+                    const spec = NPC_SPECIALTIES[npc.id];
+                    const mult = (spec && spec.bonuses && spec.bonuses[need.taskType]) || 1.0;
+                    const multTag = mult > 1.0 ? `(专长×${mult})` : '';
+                    this.game.addEvent(`🚨 资源紧急！${npc.name}${multTag}被自动分配前往${resourceNames[need.resourceType]}！`);
                 }
 
                 console.log(`[TaskSystem] 紧急分配 ${npc.name} → ${need.resourceType} (${need.targetLocation})`);
@@ -1559,6 +1628,9 @@ warningNeeds.push({ resourceType: 'woodFuel', taskType: TASK_TYPES.COLLECT_WOOD,
         if (urgency.food === 'warning' && !(activeGatherers['food']?.length > 0)) {
 warningNeeds.push({ resourceType: 'food', taskType: TASK_TYPES.COLLECT_FOOD, targetLocation: 'frozen_lake' });
         }
+        if (urgency.power === 'warning' && !(activeGatherers['power']?.length > 0)) {
+warningNeeds.push({ resourceType: 'power', taskType: TASK_TYPES.MAINTAIN_POWER, targetLocation: 'workshop_door' });
+        }
 
         for (const need of warningNeeds) {
             const candidates = aliveNpcs.filter(npc => {
@@ -1572,12 +1644,18 @@ warningNeeds.push({ resourceType: 'food', taskType: TASK_TYPES.COLLECT_FOOD, tar
 
             if (candidates.length === 0) continue;
 
+            // 【增强】warning级别也使用增强排序：排除老钱，按专长+体力排序
             candidates.sort((a, b) => {
+                const aIsQian = a.id === 'old_qian' ? 1 : 0;
+                const bIsQian = b.id === 'old_qian' ? 1 : 0;
+                if (aIsQian !== bIsQian) return aIsQian - bIsQian;
+
                 const specA = NPC_SPECIALTIES[a.id];
                 const specB = NPC_SPECIALTIES[b.id];
-                const scoreA = (specA && specA.bonuses && specA.bonuses[need.taskType] || 1) * a.stamina;
-                const scoreB = (specB && specB.bonuses && specB.bonuses[need.taskType] || 1) * b.stamina;
-                return scoreB - scoreA;
+                const multA = (specA && specA.bonuses && specA.bonuses[need.taskType]) || 1.0;
+                const multB = (specB && specB.bonuses && specB.bonuses[need.taskType]) || 1.0;
+                if (multA !== multB) return multB - multA;
+                return b.stamina - a.stamina;
             });
 
             const npc = candidates[0];
@@ -1590,7 +1668,10 @@ warningNeeds.push({ resourceType: 'food', taskType: TASK_TYPES.COLLECT_FOOD, tar
 
             if (this.game.addEvent) {
                 const resourceNames = { woodFuel: '砍柴', food: '采集食物', power: '维护电力' };
-                this.game.addEvent(`⚠️ 资源偏低，${npc.name}前往${resourceNames[need.resourceType]}补充物资`);
+                const spec = NPC_SPECIALTIES[npc.id];
+                const mult = (spec && spec.bonuses && spec.bonuses[need.taskType]) || 1.0;
+                const multTag = mult > 1.0 ? `(专长×${mult})` : '';
+                this.game.addEvent(`⚠️ 资源偏低，${npc.name}${multTag}前往${resourceNames[need.resourceType]}补充物资`);
             }
         }
     }

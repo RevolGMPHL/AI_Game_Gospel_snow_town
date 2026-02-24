@@ -99,6 +99,11 @@ class WeatherSystem {
         this.currentWeather = this.dayConfig.weather;
         this.weatherEmoji = this.dayConfig.weatherEmoji;
 
+        // 【修复】同步到game.weather，确保全局一致
+        if (this.game) {
+            this.game.weather = this.currentWeather;
+        }
+
         // 重置户外时间追踪
         this.outdoorTime = {};
 
@@ -108,6 +113,21 @@ class WeatherSystem {
         // 弹出公告
         if (this.game.addEvent) {
             this.game.addEvent(this.dayConfig.announcement);
+
+            // 【物资消耗预警】在天气播报后追加物资预估
+            if (this.game.resourceSystem && this.game.resourceSystem.getResourceForecastForPrompt) {
+                const forecast = this.game.resourceSystem.getResourceForecastForPrompt();
+                if (forecast) {
+                    this.game.addEvent(`📊 ${forecast.trim()}`);
+                }
+            }
+
+            // 补给窗口/极寒提示
+            if (newDay === 1 || newDay === 3) {
+                this.game.addEvent('📦 补给窗口！建议全员全力采集物资为后续极寒做准备！');
+            } else if (newDay === 2 || newDay === 4) {
+                this.game.addEvent('❄️ 极寒天气！木柴消耗将大幅增加，请确保储备充足！');
+            }
         }
 
         console.log(`[WeatherSystem] 第${newDay}天开始: ${this.currentTemp}°C, ${this.currentWeather}`);
@@ -196,6 +216,9 @@ class WeatherSystem {
 
     /** 户外寒冷效果 */
     _applyOutdoorEffects(temp, dt) {
+        // 【v2.1】风寒效应加成：大雪/暴风雪时属性衰减×1.3
+        const windChillMult = (this.currentWeather === '大雪' || this.currentWeather === '极寒暴风雪') ? 1.3 : 1.0;
+
         for (const npc of this.game.npcs) {
             if (npc.isDead) continue;
 
@@ -205,30 +228,61 @@ class WeatherSystem {
                 // 累计户外时间
                 this.outdoorTime[npc.id] = (this.outdoorTime[npc.id] || 0) + dt;
 
-                // 体温下降
+                // 体温下降（不受风寒属性加成影响，体温有独立的风寒逻辑）
                 if (temp < 0 && npc.bodyTemp !== undefined) {
-                    // 体温下降速率: -30°C时约-0.1°C/分钟 = -0.00167/秒
-                    //               -60°C时约-0.5°C/分钟 = -0.00833/秒
-                    const dropRate = Math.abs(temp) * 0.000167 * dt; // 线性插值
+                    // 【v2.1】体温下降速率提升: -30°C时约-0.45°C/分钟, -60°C时约-0.9°C/分钟
+                    const dropRate = Math.abs(temp) * 0.00025 * dt;
                     npc.bodyTemp = Math.max(25, npc.bodyTemp - dropRate);
                 }
 
-                // 寒冷伤害 Tier 1: 温度 < -20°C
+                // 【v2.1】梯度衰减层：温度<0°C时，越冷衰减越大
+                if (temp < 0) {
+                    const baseFactor = Math.abs(temp) / 30; // -30°C=1.0, -60°C=2.0
+                    let gradStamina = 0.15 * baseFactor * dt;
+                    let gradHealth = 0.10 * baseFactor * dt;
+                    let gradSan = 0.08 * baseFactor * dt;
+                    // 应用风寒加成
+                    gradStamina *= windChillMult;
+                    gradHealth *= windChillMult;
+                    gradSan *= windChillMult;
+                    npc.stamina = Math.max(0, npc.stamina - gradStamina);
+                    npc.health = Math.max(0, npc.health - gradHealth);
+                    npc.sanity = Math.max(0, npc.sanity - gradSan);
+                }
+
+                // 【v2.1】-20°C~0°C 轻度衰减（之前此区间无惩罚）
+                if (temp < 0 && temp >= -20) {
+                    let lightStamina = 0.05 * (Math.abs(temp) / 20) * dt;
+                    lightStamina *= windChillMult;
+                    npc.stamina = Math.max(0, npc.stamina - lightStamina);
+                }
+
+                // 寒冷伤害 Tier 1: 温度 < -20°C（【v2.1】数值强化）
                 if (temp < -20) {
-                    const staminaDrain = 0.3 * dt;
-                    const healthDrain = 0.2 * dt;
-                    const sanDrain = 0.15 * dt;
+                    let staminaDrain = 0.5 * dt;
+                    let healthDrain = 0.35 * dt;
+                    let sanDrain = 0.25 * dt;
+                    // 应用风寒加成
+                    staminaDrain *= windChillMult;
+                    healthDrain *= windChillMult;
+                    sanDrain *= windChillMult;
                     npc.stamina = Math.max(0, npc.stamina - staminaDrain);
                     npc.health = Math.max(0, npc.health - healthDrain);
                     npc.sanity = Math.max(0, npc.sanity - sanDrain);
                 }
 
-                // 寒冷伤害 Tier 2: 温度 < -50°C (致命)
+                // 寒冷伤害 Tier 2: 温度 < -50°C (致命)（【v2.1】数值强化+新增San衰减）
                 if (temp < -50) {
-                    const staminaDrain = 1.0 * dt;
-                    const healthDrain = 0.8 * dt;
+                    let staminaDrain = 1.5 * dt;
+                    let healthDrain = 1.2 * dt;
+                    let sanDrain = 0.4 * dt;
+                    // 应用风寒加成
+                    staminaDrain *= windChillMult;
+                    healthDrain *= windChillMult;
+                    sanDrain *= windChillMult;
                     npc.stamina = Math.max(0, npc.stamina - staminaDrain);
                     npc.health = Math.max(0, npc.health - healthDrain);
+                    npc.sanity = Math.max(0, npc.sanity - sanDrain);
                 }
 
                 // 第2天: 户外超过2小时严重冻伤
@@ -240,6 +294,29 @@ class WeatherSystem {
                 // 室内时重置户外累计时间（休息恢复）
                 if (this.outdoorTime[npc.id] > 0) {
                     this.outdoorTime[npc.id] = Math.max(0, (this.outdoorTime[npc.id] || 0) - dt * 2);
+                }
+
+                // 【v2.1】暖炉熄灭时室内低强度寒冷惩罚
+                if (temp < -20) {
+                    const fs = this.game.furnaceSystem;
+                    if (fs) {
+                        const nearFurnace = fs.isNearActiveFurnace(npc);
+                        if (!nearFurnace) {
+                            // 暖炉未运行，检查冷却进度
+                            // 找到NPC所在场景的暖炉（可能正在冷却）
+                            const coolingFurnace = fs.furnaces.find(f => !f.active && f._coolingTimer > 0);
+                            let coolingProgress = 1.0; // 默认完全冷却，施加满额惩罚
+                            if (coolingFurnace) {
+                                // 刚熄灭时惩罚=0%，完全冷却后惩罚=100%
+                                const cooldownTotal = 30 * 60; // cooldownMinutes=30，转为秒
+                                coolingProgress = 1 - Math.max(0, coolingFurnace._coolingTimer) / cooldownTotal;
+                            }
+                            // 低强度惩罚（约户外的1/10）
+                            npc.stamina = Math.max(0, npc.stamina - 0.03 * coolingProgress * dt);
+                            npc.health = Math.max(0, npc.health - 0.02 * coolingProgress * dt);
+                            npc.sanity = Math.max(0, npc.sanity - 0.01 * coolingProgress * dt);
+                        }
+                    }
                 }
             }
         }

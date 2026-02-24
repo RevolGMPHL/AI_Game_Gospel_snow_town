@@ -148,6 +148,11 @@ class DeathSystem {
                 npc.health = Math.max(0, npc.health - 0.15 * this._deathCheckInterval);
                 if (npc.health <= 0) {
                     npc._deathCause = '饿死';
+                    // 【调试日志】食物充足但饿死的异常情况
+                    const foodRemaining = this.game.resourceSystem ? this.game.resourceSystem.food : 0;
+                    if (foodRemaining > 0) {
+                        console.warn(`[DeathSystem] ⚠️ 异常：${npc.name} 饿死时食物储备仍有 ${Math.round(foodRemaining)}！hunger=${npc.hunger}, zeroHungerDuration=${npc._zeroHungerDuration}s`);
+                    }
                     this._processNpcDeath(npc, '饿死');
                 }
             }
@@ -177,6 +182,11 @@ class DeathSystem {
                 }
                 this._addTimelineEvent('crisis', `🚨 ${npc.name} 陷入濒死状态（饥饿+体力耗尽+健康极低）`);
                 console.warn(`[DeathSystem] ${npc.name} 进入濒死状态! health:${npc.health.toFixed(1)}`);
+                // AI模式日志：濒死状态
+                if (this.game.aiModeLogger) {
+                    const snap = AIModeLogger.npcAttrSnapshot(npc);
+                    this.game.aiModeLogger.log('DYING', `${npc.name} 进入濒死状态 | ${snap} | 位置:${npc.currentScene || '?'}`);
+                }
             }
 
             // 8. 【v2.0】濒死状态持续5分钟(300秒)无救助则死亡
@@ -211,6 +221,12 @@ class DeathSystem {
         npc._deathCause = cause;
         npc._deathTime = this.game.getTimeStr();
 
+        // 冻结死亡坐标（坟墓渲染使用，确保坟墓位置固定不动）
+        npc._deathX = npc.x;
+        npc._deathY = npc.y;
+        npc._deathScene = npc.currentScene;
+        npc.isMoving = false;
+
         // 停止所有行动
         npc.state = 'IDLE';
         npc.currentPath = [];
@@ -218,6 +234,12 @@ class DeathSystem {
         npc._pendingAction = null;
         npc._currentAction = null;
         npc._actionOverride = false;
+
+        // 清除对话气泡和AI状态，防止死亡后继续说话/思考
+        npc.expression = '';
+        npc.expressionTimer = 0;
+        npc.aiCooldown = Infinity;  // 永久禁止AI思考
+        npc._actionDecisionCooldown = Infinity; // 永久禁止行动决策
 
         // 记录死亡信息
         const causeConfig = Object.values(DEATH_CAUSES).find(c => c.id === cause) || { icon: '💀', desc: cause };
@@ -235,6 +257,21 @@ class DeathSystem {
             health: 0,
             hunger: Math.round(npc.hunger || 0),
         };
+
+        // 【异常标注】食物充足但饿死
+        const isHungerDeath = (cause === '饿死' || cause === '饥饿与体力衰竭');
+        if (isHungerDeath && this.game.resourceSystem && this.game.resourceSystem.food > 0) {
+            record.anomaly = `⚠️ 食物充足但未进食（剩余食物:${Math.round(this.game.resourceSystem.food)}）`;
+            console.warn(`[DeathSystem] ⚠️ 异常死亡：${npc.name} ${cause}，但食物储备仍有 ${Math.round(this.game.resourceSystem.food)}`);
+            if (this.game.addEvent) {
+                this.game.addEvent(`⚠️ 异常：${npc.name} 在食物充足（剩余${Math.round(this.game.resourceSystem.food)}）的情况下饿死！`);
+            }
+            // AI模式日志：异常死亡标注
+            if (this.game.aiModeLogger) {
+                this.game.aiModeLogger.log('ANOMALY', `${npc.name} ${cause}但食物储备:${Math.round(this.game.resourceSystem.food)} | 最近行为:${npc.stateDesc || '?'} | 状态:${npc.state || '?'}`);
+            }
+        }
+
         this.deathRecords.push(record);
 
         // 添加到时间线
@@ -253,6 +290,13 @@ class DeathSystem {
 
         console.log(`[DeathSystem] ${npc.name} 死亡！死因: ${cause}, 时间: ${record.time}, 体温: ${record.bodyTemp}°C`);
 
+        // AI模式日志：记录死亡详情
+        if (this.game.aiModeLogger) {
+            const snap = AIModeLogger.npcAttrSnapshot(npc);
+            const durInfo = `饥饿持续:${(npc._zeroHungerDuration || 0).toFixed(0)}s 体力枯竭持续:${(npc._zeroStaminaDuration || 0).toFixed(0)}s 失温持续:${(npc._hypothermiaDuration || 0).toFixed(0)}s 精神崩溃持续:${(npc._zeroCrazyDuration || 0).toFixed(0)}s`;
+            this.game.aiModeLogger.log('DEATH', `${npc.name}(ID:${npc.id}) 年龄:${npc.age || '?'} 职业:${npc.occupation || '?'} | 死因:${cause} | ${snap} | 位置:${npc.currentScene || '?'} | ${durInfo}`);
+        }
+
         // 触发死亡连锁反应
         this._triggerDeathChainReaction(npc, cause);
 
@@ -267,10 +311,44 @@ class DeathSystem {
         const aliveNPCs = this.game.npcs.filter(n => !n.isDead);
         if (aliveNPCs.length === 0) return;
 
-        for (const npc of aliveNPCs) {
-            // 基础San值打击: -10 【v2.0: 调整为-10，与需求文档一致】
-            let sanPenalty = -10;
+        // 【恐慌叠加】根据已死亡人数计算基础San打击叠加系数
+        const deathCount = this.deathRecords.length;
+        const baseNonClosePenalty = Math.max(-25, -10 - (deathCount - 1) * 3); // 第1人-10，第2人-13，第3人-16，上限-25
+        const baseClosePenalty = Math.max(-40, -25 - (deathCount - 1) * 3);    // 亲密者叠加，上限-40
 
+        // 【角色针对性】根据死者角色生成针对性事件文本
+        let roleSpecificText = '';
+        const deadId = deadNpc.id;
+        if (deadId === 'su_yan') {
+            roleSpecificText = '💀 团队唯一的医生苏岩已故，心理治疗能力永久丧失！';
+        } else if (deadId === 'ling_yue') {
+            roleSpecificText = '💀 唯一的音乐安抚者凌玥已故，再无人能弹吉他恢复精神！';
+        } else if (deadId === 'wang_ce') {
+            roleSpecificText = '💀 体力最强的王策已故，重体力劳动将更加困难！';
+        } else if (deadId === 'lu_chen') {
+            roleSpecificText = '💀 电气技师陆辰已故，电力维修能力受损！';
+        } else if (deadId === 'li_shen') {
+            roleSpecificText = '💀 后勤支柱李婶已故，烹饪与照料能力丧失！';
+        } else if (deadId === 'old_qian') {
+            roleSpecificText = '💀 经验丰富的老钱已故，他的智慧不可替代！';
+        } else if (deadId === 'qing_xuan') {
+            roleSpecificText = '💀 年幼的清璇已故，这是最令人心碎的悲剧！';
+        } else if (deadId === 'fang_yu') {
+            roleSpecificText = '💀 组织者方宇已故，团队协调能力受损！';
+        }
+
+        // 检查是否所有San恢复角色都已死亡
+        const suYanDead = this.deathRecords.some(r => r.npcId === 'su_yan');
+        const lingYueDead = this.deathRecords.some(r => r.npcId === 'ling_yue');
+        if (suYanDead && lingYueDead) {
+            roleSpecificText += ' ⚠️ 已无人能恢复精神状态，全员精神危机！';
+        }
+
+        if (roleSpecificText && this.game.addEvent) {
+            this.game.addEvent(roleSpecificText);
+        }
+
+        for (const npc of aliveNPCs) {
             // 判断亲密程度
             const affinity = npc.getAffinity ? npc.getAffinity(deadNpc.id) : 50;
             const isClose = affinity >= 70; // 好感度≥70视为亲密
@@ -278,9 +356,12 @@ class DeathSystem {
             // 特殊家庭关系判定
             const isFamilyRelation = this._isFamilyRelation(npc.id, deadNpc.id);
 
+            // 【恐慌叠加】使用叠加后的惩罚值
+            let sanPenalty = baseNonClosePenalty;
+
             if (isFamilyRelation || isClose) {
-                // 亲密者/家人: San值打击-25
-                sanPenalty = -25;
+                // 亲密者/家人: 使用亲密叠加惩罚
+                sanPenalty = baseClosePenalty;
 
                 // 进入悲痛状态（效率×0.3，持续2小时=7200游戏秒）
                 this._griefEffects.push({
@@ -295,15 +376,26 @@ class DeathSystem {
 
                 npc.mood = '悲痛';
                 npc.stateDesc = `因${deadNpc.name}的死亡陷入悲痛`;
-                npc.expression = `${deadNpc.name}…不…`;
+                // 【个性化悲痛文本】根据关系生成
+                if (isFamilyRelation) {
+                    npc.expression = `${deadNpc.name}！！不要离开我…`;
+                } else {
+                    npc.expression = `${deadNpc.name}…你怎么就…`;
+                }
                 npc.expressionTimer = 15;
 
                 if (this.game.addEvent) {
-                    this.game.addEvent(`😢 ${npc.name} 因${deadNpc.name}的死亡陷入深深的悲痛（San-25，效率降至30%）`);
+                    this.game.addEvent(`😢 ${npc.name} 因${deadNpc.name}的死亡陷入深深的悲痛（San${sanPenalty}，效率降至30%）`);
                 }
             } else {
-                // 非亲密: San-15 + 恐惧
-                npc.expression = `${deadNpc.name}死了…我们也会…`;
+                // 非亲密: 恐惧反应 + 个性化文本
+                if (deathCount >= 3) {
+                    npc.expression = `又有人死了…我们撑不下去了…`;
+                } else if (deathCount >= 2) {
+                    npc.expression = `又一个人走了…${deadNpc.name}…`;
+                } else {
+                    npc.expression = `${deadNpc.name}死了…我们也会…`;
+                }
                 npc.expressionTimer = 10;
             }
 
@@ -316,8 +408,9 @@ class DeathSystem {
             }
         }
 
-        // 全体恐惧事件
-        this._addTimelineEvent('crisis', `全镇因${deadNpc.name}的死亡陷入悲痛和恐惧`);
+        // 全体恐惧事件（包含恐慌叠加信息）
+        const panicLevel = deathCount >= 3 ? '极度恐慌' : (deathCount >= 2 ? '恐慌蔓延' : '悲痛和恐惧');
+        this._addTimelineEvent('crisis', `全镇因${deadNpc.name}的死亡陷入${panicLevel}（已${deathCount}人死亡）`);
     }
 
     /** 判断是否为家庭关系 */
@@ -384,6 +477,11 @@ class DeathSystem {
         const aliveCount = this.game.npcs.filter(n => !n.isDead).length;
         if (aliveCount === 0) {
             console.log('[DeathSystem] 🚨 全灭！所有NPC已死亡');
+            // AI模式日志：全灭汇总
+            if (this.game.aiModeLogger) {
+                const deathSummary = this.deathRecords.map(r => `${r.npcName}-${r.cause}(D${r.dayNum} ${r.time})`).join('; ');
+                this.game.aiModeLogger.log('EXTINCTION', `全员死亡! 共${this.deathRecords.length}人 | 死亡记录: ${deathSummary}`);
+            }
             this._addTimelineEvent('crisis', '🚨 全员死亡…小镇陷入了永恒的沉寂');
             this._triggerEnding();
         }
@@ -423,6 +521,40 @@ class DeathSystem {
         }
 
         console.log(`[DeathSystem] 🏁 结局触发: ${this.currentEnding.title} (存活${aliveCount}人)`);
+
+        // AI模式日志：结局汇总
+        if (this.game.aiModeLogger) {
+            let endingLog = `结局: ${this.currentEnding.title} | 存活${aliveCount}/8人\n`;
+            // 死亡记录摘要
+            if (this.deathRecords.length > 0) {
+                endingLog += `  死亡记录(${this.deathRecords.length}人):\n`;
+                for (const r of this.deathRecords) {
+                    endingLog += `    ${r.npcName} - ${r.cause} - D${r.dayNum} ${r.time}${r.anomaly ? ' ' + r.anomaly : ''}\n`;
+                }
+            }
+            // 最终资源储量
+            const rs = this.game.resourceSystem;
+            if (rs) {
+                const tc = rs.totalConsumed || {};
+                endingLog += `  最终资源: 木柴:${rs.woodFuel != null ? rs.woodFuel.toFixed(1) : '?'} 食物:${rs.food != null ? rs.food.toFixed(1) : '?'} 电力:${rs.power != null ? rs.power.toFixed(1) : '?'} 建材:${rs.material != null ? rs.material.toFixed(1) : '?'}\n`;
+                endingLog += `  总消耗: 木柴:${(tc.woodFuel || 0).toFixed(1)} 食物:${(tc.food || 0).toFixed(1)} 电力:${(tc.power || 0).toFixed(1)} 建材:${(tc.material || 0).toFixed(1)}\n`;
+            }
+            // 关键事件时间线
+            if (this.timeline && this.timeline.length > 0) {
+                endingLog += `  关键事件时间线:\n`;
+                for (const evt of this.timeline) {
+                    endingLog += `    D${evt.dayNum || '?'} ${evt.time || '?'} [${evt.type}] ${evt.text}\n`;
+                }
+            }
+            // 每个NPC最终属性
+            endingLog += `  NPC最终状态:\n`;
+            for (const npc of this.game.npcs) {
+                const snap = AIModeLogger.npcAttrSnapshot(npc);
+                endingLog += `    ${npc.name} | ${npc.isDead ? '已故-' + (npc._deathCause || '?') : '存活'} | ${snap} | ${npc.currentScene || '?'}\n`;
+            }
+            this.game.aiModeLogger.log('ENDING', endingLog);
+            this.game.aiModeLogger.forceFlush();
+        }
 
         // 暂停游戏
         this.game.paused = true;
@@ -714,20 +846,15 @@ class DeathSystem {
                 </div>
             `;
         } else {
-            // 非轮回模式：保持原有按钮
+            // 非轮回模式（agent）：不显示轮回按钮，仅显示"本局已结束"提示 + 彻底重来 + 继续观察
             html += `
                 <div style="text-align:center; margin-top:20px;">
-                    <button id="btn-ending-reincarnate" style="
+                    <div style="font-size:15px; color:#888; margin-bottom:14px;">🏁 本局已结束，没有轮回机会</div>
+                    <button id="btn-ending-reset" style="
                         background: linear-gradient(135deg, ${ending.color}60, ${ending.color}30);
                         border: 1px solid ${ending.color}60; color: #fff;
                         padding: 12px 36px; border-radius: 10px; font-size: 16px;
                         cursor: pointer; transition: all 0.3s;
-                    ">🔄 轮回重生</button>
-                    <button id="btn-ending-reset" style="
-                        background: rgba(255,255,255,0.08);
-                        border: 1px solid rgba(255,255,255,0.15); color: #aaa;
-                        padding: 12px 28px; border-radius: 10px; font-size: 14px;
-                        cursor: pointer; margin-left: 12px; transition: all 0.3s;
                     ">🆕 彻底重来</button>
                     <button id="btn-ending-continue" style="
                         background: rgba(255,255,255,0.08);
@@ -845,9 +972,7 @@ class DeathSystem {
                 if (btnResume) btnResume.addEventListener('click', doReincarnate);
 
             } else {
-                // ====== 非轮回模式：原有按钮绑定 ======
-                const btnReincarnate = document.getElementById('btn-ending-reincarnate');
-                if (btnReincarnate) btnReincarnate.addEventListener('click', doReincarnate);
+                // ====== 非轮回模式：无轮回按钮，不绑定轮回事件 ======
             }
 
             // 通用按钮（两种模式都可能存在）
@@ -868,11 +993,16 @@ class DeathSystem {
             const npc = this.game.npcs.find(n => n.id === record.npcId);
             if (!npc) continue;
 
-            // 只在同一场景中绘制
-            if (npc.currentScene !== this.game.currentScene) continue;
+            // 使用冻结的死亡坐标（兼容旧存档：若无冻结坐标则回退到实时坐标）
+            const graveScene = npc._deathScene !== undefined ? npc._deathScene : npc.currentScene;
+            const graveX = npc._deathX !== undefined ? npc._deathX : npc.x;
+            const graveY = npc._deathY !== undefined ? npc._deathY : npc.y;
 
-            const x = npc.x - offsetX;
-            const y = npc.y - offsetY;
+            // 只在同一场景中绘制
+            if (graveScene !== this.game.currentScene) continue;
+
+            const x = graveX - offsetX;
+            const y = graveY - offsetY;
 
             // 绘制墓碑
             ctx.save();
@@ -969,12 +1099,30 @@ class DeathSystem {
         return [...this.deathRecords];
     }
 
-    /** 获取死亡摘要（给AI prompt用） */
+    /** 获取死亡摘要（给AI prompt用，控制在100字以内） */
     getDeathSummaryForPrompt() {
         if (this.deathRecords.length === 0) return '';
 
         let summary = `已有${this.deathRecords.length}人死亡: `;
         summary += this.deathRecords.map(r => `${r.npcName}(${r.cause})`).join('、');
+
+        // 标注不可替代能力的丧失
+        const deadIds = this.deathRecords.map(r => r.npcId);
+        const suyanDead = deadIds.includes('su_yan');
+        const lingyueDead = deadIds.includes('ling_yue');
+
+        if (suyanDead && lingyueDead) {
+            summary += '。⚠️ 已无人能恢复精神状态';
+        } else if (suyanDead) {
+            summary += '。⚠️ 医生已死，心理治疗能力丧失，仅凌玥可弹吉他安抚';
+        } else if (lingyueDead) {
+            summary += '。⚠️ 唯一音乐安抚者已死，仅苏岩可心理治疗';
+        }
+
+        // 控制长度不超过100字
+        if (summary.length > 100) {
+            summary = summary.substring(0, 97) + '...';
+        }
         return summary;
     }
 
@@ -995,8 +1143,18 @@ class DeathSystem {
     // ============ 序列化 ============
 
     serialize() {
+        // 在死亡记录中额外保存冻结坐标
+        const enrichedRecords = this.deathRecords.map(r => {
+            const npc = this.game.npcs.find(n => n.id === r.npcId);
+            return {
+                ...r,
+                _deathX: npc ? npc._deathX : undefined,
+                _deathY: npc ? npc._deathY : undefined,
+                _deathScene: npc ? npc._deathScene : undefined,
+            };
+        });
         return {
-            deathRecords: [...this.deathRecords],
+            deathRecords: enrichedRecords,
             timeline: [...this.timeline],
             endingTriggered: this.endingTriggered,
             currentEnding: this.currentEnding ? this.currentEnding.id : null,
@@ -1024,6 +1182,16 @@ class DeathSystem {
                 ...g,
                 startTime: 0,
             }));
+        }
+
+        // 恢复冻结坐标到对应NPC对象
+        for (const record of this.deathRecords) {
+            const npc = this.game.npcs.find(n => n.id === record.npcId);
+            if (npc) {
+                if (record._deathX !== undefined) npc._deathX = record._deathX;
+                if (record._deathY !== undefined) npc._deathY = record._deathY;
+                if (record._deathScene !== undefined) npc._deathScene = record._deathScene;
+            }
         }
     }
 }

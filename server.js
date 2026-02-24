@@ -12,10 +12,14 @@ const path = require('path');
 const PORT = 8080;
 const ROOT_DIR = __dirname;
 const LOG_DIR = path.join(ROOT_DIR, 'log', 'debug_log');
+const AIMODE_LOG_DIR = path.join(ROOT_DIR, 'log', 'aimode_log');
 
 // 确保日志目录存在
 if (!fs.existsSync(LOG_DIR)) {
     fs.mkdirSync(LOG_DIR, { recursive: true });
+}
+if (!fs.existsSync(AIMODE_LOG_DIR)) {
+    fs.mkdirSync(AIMODE_LOG_DIR, { recursive: true });
 }
 
 // MIME类型映射
@@ -109,6 +113,66 @@ const server = http.createServer((req, res) => {
         return;
     }
 
+    // ========== API: 保存 AI模式 Log（覆盖写入） ==========
+    if (req.method === 'POST' && req.url === '/api/save-aimode-log') {
+        let body = '';
+        req.on('data', chunk => { body += chunk; });
+        req.on('end', () => {
+            try {
+                const data = JSON.parse(body);
+                const filename = data.filename || `aimode_${new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19)}.log`;
+                const filepath = path.join(AIMODE_LOG_DIR, filename);
+
+                // 安全检查：防止路径穿越
+                if (!filepath.startsWith(AIMODE_LOG_DIR)) {
+                    res.writeHead(400, { 'Content-Type': 'application/json' });
+                    res.end(JSON.stringify({ error: '非法文件路径' }));
+                    return;
+                }
+
+                fs.writeFileSync(filepath, data.content || '', 'utf-8');
+                console.log(`📝 AI模式 log 已保存: ${filename} (${(data.content || '').length} 字符)`);
+
+                res.writeHead(200, { 'Content-Type': 'application/json' });
+                res.end(JSON.stringify({ success: true, filename, path: filepath }));
+            } catch (err) {
+                console.error('❌ 保存AI模式log出错:', err.message);
+                res.writeHead(500, { 'Content-Type': 'application/json' });
+                res.end(JSON.stringify({ error: err.message }));
+            }
+        });
+        return;
+    }
+
+    // ========== API: 追加 AI模式 Log（增量写入） ==========
+    if (req.method === 'POST' && req.url === '/api/append-aimode-log') {
+        let body = '';
+        req.on('data', chunk => { body += chunk; });
+        req.on('end', () => {
+            try {
+                const data = JSON.parse(body);
+                const filename = data.filename || 'current_aimode_session.log';
+                const filepath = path.join(AIMODE_LOG_DIR, filename);
+
+                if (!filepath.startsWith(AIMODE_LOG_DIR)) {
+                    res.writeHead(400, { 'Content-Type': 'application/json' });
+                    res.end(JSON.stringify({ error: '非法文件路径' }));
+                    return;
+                }
+
+                fs.appendFileSync(filepath, (data.content || '') + '\n', 'utf-8');
+
+                res.writeHead(200, { 'Content-Type': 'application/json' });
+                res.end(JSON.stringify({ success: true, filename }));
+            } catch (err) {
+                console.error('❌ 追加AI模式log出错:', err.message);
+                res.writeHead(500, { 'Content-Type': 'application/json' });
+                res.end(JSON.stringify({ error: err.message }));
+            }
+        });
+        return;
+    }
+
     // ========== API: 列出 Debug Log 文件 ==========
     if (req.method === 'GET' && req.url === '/api/list-debug-logs') {
         try {
@@ -161,9 +225,12 @@ server.listen(PORT, '0.0.0.0', () => {
     console.log(`📡 地址: http://localhost:${PORT}`);
     console.log(`📂 根目录: ${ROOT_DIR}`);
     console.log(`📝 Debug Log: ${LOG_DIR}`);
+    console.log(`📝 AI模式 Log: ${AIMODE_LOG_DIR}`);
     console.log(`\n可用 API:`);
     console.log(`  POST /api/save-debug-log    - 保存完整debug log`);
     console.log(`  POST /api/append-debug-log  - 追加debug log`);
     console.log(`  GET  /api/list-debug-logs   - 列出所有debug log文件`);
+    console.log(`  POST /api/save-aimode-log   - 保存AI模式log（覆盖）`);
+    console.log(`  POST /api/append-aimode-log - 追加AI模式log（增量）`);
     console.log(`\n按 Ctrl+C 停止服务器\n`);
 });

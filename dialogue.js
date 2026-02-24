@@ -130,8 +130,8 @@ class DialogueManager {
             this.aiRoundRobinIdx = (this.aiRoundRobinIdx + 1) % npcs.length;
             const npc = npcs[this.aiRoundRobinIdx];
 
-            // 跳过睡眠中的NPC
-            if (npc.isSleeping) continue;
+            // 跳过死亡或睡眠中的NPC
+            if (npc.isDead || npc.isSleeping) continue;
 
             if (npc.aiCooldown <= 0 && npc.state !== 'CHATTING') {
                 npc.think(this.game);
@@ -142,7 +142,7 @@ class DialogueManager {
         const priorityIds = ['old_qian', 'wang_teacher'];
         for (const pid of priorityIds) {
             const npc = npcs.find(n => n.id === pid);
-            if (npc && !npc.isSleeping && npc.aiCooldown <= 0 && npc.state !== 'CHATTING') {
+            if (npc && !npc.isDead && !npc.isSleeping && npc.aiCooldown <= 0 && npc.state !== 'CHATTING') {
                 npc.think(this.game);
             }
         }
@@ -154,7 +154,7 @@ class DialogueManager {
         if (!this._socialCheckIdx) this._socialCheckIdx = 0;
         this._socialCheckIdx = (this._socialCheckIdx + 1) % npcs.length;
         const socialNpc = npcs[this._socialCheckIdx];
-        if (socialNpc && !socialNpc.isSleeping && socialNpc.state === 'IDLE' 
+        if (socialNpc && !socialNpc.isDead && !socialNpc.isSleeping && socialNpc.state === 'IDLE' 
             && !socialNpc._chatWalkTarget && !socialNpc._hungerOverride
             && !this.isProcessing
             && this.npcChatQueue.length === 0) {
@@ -167,7 +167,7 @@ class DialogueManager {
         if (!this._actionRoundRobinIdx) this._actionRoundRobinIdx = 0;
         this._actionRoundRobinIdx = (this._actionRoundRobinIdx + 1) % npcs.length;
         const actionNpc = npcs[this._actionRoundRobinIdx];
-        if (actionNpc && !actionNpc.isSleeping && actionNpc.state !== 'CHATTING' 
+        if (actionNpc && !actionNpc.isDead && !actionNpc.isSleeping && actionNpc.state !== 'CHATTING' 
             && actionNpc._actionDecisionCooldown <= 0) {
             actionNpc._actionDecision(this.game);
         }
@@ -374,6 +374,9 @@ let reply = await callLLM(systemPrompt, userPrompt, debugMode2 ? 100 : 300);
     // ============ NPC ↔ NPC 对话 ============
 
     startNPCChat(npc1, npc2) {
+        // 【全局聊天开关】最终防线：开关关闭时所有NPC间聊天一律不执行
+        if (!CHAT_ENABLED) return;
+
         if (npc1.state === 'CHATTING' || npc2.state === 'CHATTING') return;
 
         // 【关键修复】任一NPC过了就寝时间就不发起新对话
@@ -869,10 +872,24 @@ let reply = await callLLM(systemPrompt, userPrompt, debugMode2 ? 100 : 300);
             sanityHint = `\n你现在有些焦虑和疲惫，说话可能带点消极情绪。`;
         }
 
+        // 【悲痛状态注入】检查说话者是否处于悲痛中，影响对话内容和行为决策
+        if (this.game && this.game.deathSystem && this.game.deathSystem.isNpcGrieving(speaker.id)) {
+            const griefEffects = this.game.deathSystem._griefEffects.filter(g => g.npcId === speaker.id);
+            const deadNames = griefEffects.map(g => g.deadNpcName).join('、');
+            sanityHint += `\n😢 你正因${deadNames}的死亡陷入深深的悲痛，做事效率大幅降低，情绪极度低落。你会时不时提到逝者，说话带着哀伤和无力感。`;
+        }
+
         // 【关心对话模式】如果是关心低San值的朋友
         let careHint = '';
         if (listener.sanity < 30 && speaker.getAffinity(listener.id) >= 70) {
             careHint = `\n💕 你注意到${listener.name}精神状态很差，你很担心ta。你会主动关心ta、安慰ta、问ta怎么了，提议陪ta去看医生或者休息。你是ta的好朋友，你真心在乎ta。`;
+        }
+
+        // 【悲痛状态注入】检查对话对象是否处于悲痛中
+        if (this.game && this.game.deathSystem && this.game.deathSystem.isNpcGrieving(listener.id)) {
+            const listenerGriefEffects = this.game.deathSystem._griefEffects.filter(g => g.npcId === listener.id);
+            const listenerDeadNames = listenerGriefEffects.map(g => g.deadNpcName).join('、');
+            careHint += `\n🕊️ ${listener.name}正因失去${listenerDeadNames}而悲痛不已，你能感受到ta的哀伤。`;
         }
 
         // 【关键】注入好感度和关系状态，让LLM感知两人真实关系
@@ -929,6 +946,12 @@ let reply = await callLLM(systemPrompt, userPrompt, debugMode2 ? 100 : 300);
             taskContext = `你的当前任务: ${this.game.taskSystem.getNpcTaskDescForPrompt(speaker.id)}`;
         }
 
+        // 【死亡系统】注入死亡记录摘要
+        let deathContext = '';
+        if (this.game && this.game.deathSystem) {
+            deathContext = this.game.deathSystem.getDeathSummaryForPrompt();
+        }
+
         // 【轮回系统】注入前世记忆提示
         let pastLifeHint = '';
         if (this.game && this.game.reincarnationSystem && this.game.reincarnationSystem.getLifeNumber() > 1) {
@@ -941,7 +964,7 @@ let reply = await callLLM(systemPrompt, userPrompt, debugMode2 ? 100 : 300);
 你正在和「${listener.name}」（${listener.gender || '男'}性，${listener.occupation}）面对面聊天。
 ${relationDesc}${cooldownHint}${memoryHint}${sanityHint}${careHint}
 
-${blizzardContext ? blizzardContext + '\n' : ''}${survivalContext ? survivalContext + '\n' : ''}${taskContext ? taskContext + '\n' : ''}${pastLifeHint ? pastLifeHint + '\n' : ''}
+${blizzardContext ? blizzardContext + '\n' : ''}${survivalContext ? survivalContext + '\n' : ''}${taskContext ? taskContext + '\n' : ''}${deathContext ? deathContext + '\n' : ''}${pastLifeHint ? pastLifeHint + '\n' : ''}
 重要规则：
 1. 你必须直接回应对方刚说的话，不能各说各的。
 2. 说话要口语化、自然（1-3句话）。每次说话要有新的信息量，不要重复之前说过的内容和用词。

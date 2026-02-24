@@ -5,7 +5,7 @@
     <em>一款由 AI 驱动的像素风末日生存模拟 — 8 位自主 NPC 在 4 天极寒暴风雪中求生，由大语言模型实时推理驱动。</em>
   </p>
   <p align="center">
-    <a href="README.md">English</a> · 
+    <a href="./README.md">English</a> · 
     <a href="#快速开始">快速开始</a> · 
     <a href="#核心特性">核心特性</a> ·
     <a href="#系统架构">系统架构</a>

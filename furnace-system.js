@@ -365,6 +365,15 @@ class FurnaceSystem {
 
     /** 判断NPC是否在某个运转中暖炉的有效范围内 */
     isNearActiveFurnace(npc) {
+        // 【修复】室内场景（宿舍、食堂、医院等）由中央暖炉供暖管道覆盖
+        // 只要有任意活跃暖炉运转中，室内NPC就享受暖炉保护
+        const INDOOR_SCENES = ['dorm_a', 'dorm_b', 'kitchen', 'medical', 'warehouse', 'workshop'];
+        if (INDOOR_SCENES.includes(npc.currentScene)) {
+            // 找到任意一座运转中的暖炉即可
+            const activeFurnace = this.furnaces.find(f => f.active);
+            if (activeFurnace) return activeFurnace;
+        }
+
         for (const furnace of this.furnaces) {
             if (!furnace.active) continue;
             if (this._isInFurnaceRange(npc, furnace)) {
@@ -405,6 +414,16 @@ class FurnaceSystem {
 
     /** 获取NPC所在位置的室内温度 */
     getIndoorTempForNpc(npc) {
+        // 【修复】室内场景（宿舍等）由中央暖炉供暖
+        const INDOOR_SCENES = ['dorm_a', 'dorm_b', 'kitchen', 'medical', 'warehouse', 'workshop'];
+        if (INDOOR_SCENES.includes(npc.currentScene)) {
+            const activeFurnace = this.furnaces.find(f => f.active);
+            if (activeFurnace) return activeFurnace.indoorTemp;
+            // 没有活跃暖炉，返回室内降温后的温度（介于暖炉温度和室外之间）
+            const coolingFurnace = this.furnaces.find(f => f._coolingTimer > 0);
+            if (coolingFurnace) return coolingFurnace.indoorTemp;
+        }
+
         for (const furnace of this.furnaces) {
             if (this._isInFurnaceRange(npc, furnace)) {
                 return furnace.indoorTemp;

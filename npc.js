@@ -4,6 +4,21 @@
  * 依赖: maps.js (TILE, C, findPath), game.js (callLLM, parseLLMJSON)
  */
 
+// 【全局聊天开关】设为 false 时完全禁止所有 NPC 间聊天，避免聊天阻塞生存行为
+// 使用 var 以便跨 <script> 标签共享（dialogue.js 等其他模块也需要读取）
+var CHAT_ENABLED = false;
+
+// ============ 行为锁优先级定义 ============
+// 用于统一行为状态机，只有更高优先级才能打断当前行为
+const BEHAVIOR_PRIORITY = {
+    FREE: 0,        // 自由行动：闲逛、社交、LLM低优先级决策
+    WORK: 1,        // 任务/工作：taskOverride、资源采集、日程工作
+    RECOVERY: 2,    // 恢复行为：休息、看病途中
+    BASIC_NEED: 3,  // 基本需求：吃饭、睡觉、治疗中
+    SURVIVAL: 4,    // 生存紧急：第4天室内锁定、严重失温(体温<35°C)
+    FATAL: 5,       // 致命紧急：体温<33°C、健康<10
+};
+
 // ============ NPC 配置 — 末日极寒生存 ============
 const NPC_CONFIGS = [
     {
@@ -186,12 +201,15 @@ const NPC_CONFIGS = [
         schedule: [
             { start: 6,  end: 7,  action: 'WALK_TO', target: 'kitchen_door',  desc: '起床去吃早餐' },
             { start: 7,  end: 8,  action: 'WALK_TO', target: 'medical_door',  desc: '去医疗站准备药品、检查设备' },
-            { start: 8,  end: 12, action: 'STAY',    target: 'medical_inside', desc: '在医疗站坐诊、治疗冻伤患者' },
+            { start: 8,  end: 10, action: 'STAY',    target: 'medical_inside', desc: '在医疗站坐诊、治疗冻伤患者' },
+            { start: 10, end: 12, action: 'WALK_TO', target: 'frozen_lake',   desc: '去冰湖采集食物' },
             { start: 12, end: 13, action: 'WALK_TO', target: 'kitchen_door',  desc: '去炊事房吃午饭' },
-            { start: 13, end: 17, action: 'STAY',    target: 'medical_inside', desc: '下午继续诊疗、心理疏导' },
+            { start: 13, end: 15, action: 'WALK_TO', target: 'frozen_lake',   desc: '下午去冰湖采集食物' },
+            { start: 15, end: 17, action: 'STAY',    target: 'medical_inside', desc: '下午在医疗站坐诊、心理疏导' },
             { start: 17, end: 18, action: 'WALK_TO', target: 'furnace_plaza', desc: '去暖炉旁巡查大家的健康状况' },
             { start: 18, end: 19, action: 'WALK_TO', target: 'kitchen_door',  desc: '去炊事房吃晚饭' },
-            { start: 19, end: 22, action: 'STAY',    target: 'medical_inside', desc: '夜间值班、处理突发伤病' },
+            { start: 19, end: 21, action: 'STAY',    target: 'furnace_plaza',  desc: '在暖炉旁巡查大家的健康、安抚民心' },
+            { start: 21, end: 22, action: 'STAY',    target: 'medical_inside', desc: '夜间值班、处理突发伤病' },
             { start: 22, end: 24, action: 'STAY',    target: 'medical_inside', desc: '深夜整理药品、写医疗记录' },
             { start: 0,  end: 6,  action: 'STAY',    target: 'dorm_a_bed_2',  desc: '在宿舍A休息睡觉' },
         ],
@@ -333,23 +351,25 @@ const ACTION_EFFECT_MAP = [
     // 维修发电机/技术工作 → 产出电力
     { keywords: ['维修发电机', '检查发电机', '技术工作', '制造工具'], requiredScene: 'workshop', effectType: 'produce_resource', resourceType: 'power', ratePerHour: 8, bubbleText: '🔧 维修发电机中（⚡+8/h）' },
     // 设计暖炉扩建方案/协助建造 → 推进建造进度
-    { keywords: ['暖炉扩建', '设计暖炉', '协助建造', '扩建'], requiredScene: 'workshop', effectType: 'build_progress', ratePerHour: 1, bubbleText: '🔨 暖炉扩建设计中' },
+    { keywords: ['暖炉扩建', '设计暖炉', '协助建造', '扩建', '整理图纸', '规划'], requiredScene: 'workshop', effectType: 'build_progress', ratePerHour: 1, bubbleText: '🔨 暖炉扩建设计中' },
     // 制作急救包/草药制剂 → 制作急救包
-    { keywords: ['制作草药', '急救包', '草药制剂', '制药'], requiredScene: 'medical', effectType: 'craft_medkit', ratePerHour: 0.5, bubbleText: '💊 制作急救包中' },
+    { keywords: ['制作草药', '急救包', '草药制剂', '制药', '整理药品'], requiredScene: 'medical', effectType: 'craft_medkit', ratePerHour: 0.5, bubbleText: '💊 制作急救包中' },
     // 修理无线电 → 推进修理进度
     { keywords: ['修理无线电', '无线电台'], requiredScene: 'workshop', effectType: 'repair_radio', ratePerHour: 1, bubbleText: '📻 修理无线电中' },
     // 管理仓库/盘点物资/整理库存 → 减少食物浪费
-    { keywords: ['盘点物资', '整理库存', '管理物资', '物资分配'], requiredScene: 'warehouse', effectType: 'reduce_waste', bubbleText: '📦 管理仓库中（浪费-20%）' },
+    { keywords: ['盘点物资', '整理库存', '管理物资', '物资分配', '搬运', '整理物资'], requiredScene: 'warehouse', effectType: 'reduce_waste', bubbleText: '📦 管理仓库中（浪费-20%）' },
     // 做饭/准备早餐/晚餐 → 减少食物浪费
     { keywords: ['做早餐', '准备早餐', '准备晚餐', '分配食物', '准备午餐', '准备明日食材'], requiredScene: 'kitchen', effectType: 'reduce_waste', bubbleText: '🍳 烹饪中（浪费-20%）' },
     // 坐诊/治疗冻伤/心理疏导 → 医疗效果
-    { keywords: ['坐诊', '治疗冻伤', '心理疏导', '巡查伤员', '医疗救治'], requiredScene: 'medical', effectType: 'medical_heal', ratePerHour: 1, bubbleText: '🏥 医疗救治中' },
+    { keywords: ['坐诊', '治疗冻伤', '心理疏导', '巡查伤员', '医疗救治', '处理伤员'], requiredScene: 'medical', effectType: 'medical_heal', ratePerHour: 1, bubbleText: '🏥 医疗救治中' },
+    // 巡查健康状况（不限场景，匹配苏岩暖炉广场巡查）→ 医疗效果
+    { keywords: ['巡查'], requiredScene: null, effectType: 'medical_heal', ratePerHour: 1, bubbleText: '🏥 巡查健康中' },
     // 维护暖炉/添加柴火 → 暖炉维护（不额外产出，但确保暖炉运转）
     { keywords: ['维护暖炉', '添加柴火'], requiredScene: null, effectType: 'furnace_maintain', bubbleText: '🔥 维护暖炉中' },
     // 巡逻/警戒 → 全队San恢复加成
-    { keywords: ['巡逻', '警戒', '安全巡查'], requiredScene: 'village', effectType: 'patrol_bonus', bubbleText: '🛡️ 巡逻警戒中' },
+    { keywords: ['巡逻', '警戒', '安全巡查', '巡视', '陷阱', '警报'], requiredScene: 'village', effectType: 'patrol_bonus', bubbleText: '🛡️ 巡逻警戒中' },
     // 安抚/调解/统筹/鼓舞 → San恢复
-    { keywords: ['安抚', '调解冲突', '统筹', '鼓舞', '讲故事', '安慰', '心理支持'], requiredScene: null, effectType: 'morale_boost', ratePerHour: 2, bubbleText: '💬 安抚鼓舞中' },
+    { keywords: ['安抚', '调解冲突', '统筹', '鼓舞', '讲故事', '安慰', '心理支持', '协调', '谈心'], requiredScene: null, effectType: 'morale_boost', ratePerHour: 2, bubbleText: '💬 安抚鼓舞中' },
     // 修理工具 → 产出少量电力
     { keywords: ['修理工具'], requiredScene: 'workshop', effectType: 'produce_resource', resourceType: 'power', ratePerHour: 4, bubbleText: '🔧 修理工具中' },
 ];
@@ -571,6 +591,13 @@ this.affinity = { qing_xuan: 72 };
         this.isSleeping = false;
         this.sleepZTimer = 0; // "Zzz" 动画计时器
 
+        // 【休息缓冲期】白天rest到达宿舍后，保持停留一段时间再让日程系统接管
+        this._restCooldownTimer = 0; // 单位：秒（游戏时间），>0 表示正在休息缓冲期中
+
+        // 【强制睡眠标记】区分日程睡眠和体力不支/白天休息强制入睡
+        this._forcedSleep = false;       // 是否为强制睡眠（非日程驱动）
+        this._forcedSleepTimer = 0;      // 强制睡眠已持续的游戏时间（秒）
+
         // 下雨避雨
         this.isSeekingShelter = false;
         this.hasUmbrella = Math.random() > 0.6; // 40% 概率有伞
@@ -590,6 +617,13 @@ this.affinity = { qing_xuan: 72 };
         this._hungerTarget = null;      // 饥饿驱动的目标场所
         this._hungerTriggerCooldown = 0; // 饥饿触发冷却计时器
 
+        // ============ 资源采集覆盖系统（参考饥饿覆盖模式） ============
+        this._resourceGatherOverride = false;  // 资源采集覆盖激活中
+        this._resourceGatherTarget = null;     // 采集目标位置key（如'lumber_camp'/'frozen_lake'）
+        this._resourceGatherType = null;       // 采集资源类型: 'wood'|'food'|null
+        this._resourceGatherTravelTimer = 0;   // 采集超时兜底计时（秒）
+        this._resourceGatherCooldown = 0;      // 采集触发冷却计时器（秒）
+
         // ============ 状态驱动行为覆盖系统 ============
         // 类似饥饿覆盖，当NPC状态极差时打断日程执行紧急行为
         this._stateOverride = null;     // 当前状态覆盖类型: 'exhausted'|'sick'|'mental'|null
@@ -606,6 +640,8 @@ this.affinity = { qing_xuan: 72 };
 
         // 进出门过渡系统
         this._walkingToDoor = false;    // 正在走向室内门口准备出门
+        this._indoorEntryProtection = 0; // 进屋保护期计时器（秒），进入室内后短暂冻结跨场景导航防止闪现
+        this._indoorEntryProtection = 0; // 进屋保护期计时器（秒），进入室内后短暂冻结跨场景导航防止闪现
         this._exitDoorTarget = null;    // 出门后的目标 {scene, x, y}
         this._enterWalkTarget = null;   // 进门后需要走到的室内目标位置
 
@@ -697,6 +733,7 @@ this.affinity = { qing_xuan: 72 };
         this._isCompanion = false;              // 当前是否作为同伴跟随中
         this._companionLeader = null;           // 正在跟随的领导者NPC id
         this._companionDestination = null;      // 同伴模式的目标位置key
+        this._companionStartTime = 0;           // 同伴模式开始时间（用于超时释放）
         this._lastActionThought = '';           // 上一次行动决策的思考记录（供think参考）
 
         // ============ Debug日志系统 ============
@@ -734,6 +771,12 @@ this.affinity = { qing_xuan: 72 };
         };
         this._goalCheckTimer = 0;    // 目标检测计时器
         this._lastGoalDay = -1;      // 上次重置目标的天数
+
+        // ============ 统一行为锁系统（BehaviorLock） ============
+        // 防止多个覆盖系统互相打断，确保吃饭/休息/睡觉等行为完整执行
+        this._currentBehaviorLock = null;   // 当前行为锁 { type: string, priority: number, startTime: number } 或 null
+        this._pendingBehaviors = [];         // 待执行行为队列（最多3个）[{ type, priority, callback }]
+        this._activeOverride = 'none';       // 当前覆盖系统快照: 'none'|'hunger'|'state'|'action'|'resource'|'task'
 
         // 游戏引用
         this.game = game;
@@ -802,6 +845,168 @@ this.affinity = { qing_xuan: 72 };
             const body = d.lines.map(l => `  ${l.speaker}: ${l.text}`).join('\n');
             return header + '\n' + body;
         }).join('\n\n');
+    }
+
+    // ============ 统一行为锁（BehaviorLock）核心方法 ============
+
+    /**
+     * 尝试获取行为锁
+     * @param {string} type - 行为类型（如'eating','sleeping','resting','treating','gathering'）
+     * @param {number} priority - 行为优先级（使用BEHAVIOR_PRIORITY常量）
+     * @param {Function} [callback] - 如果被放入pending队列，恢复时的回调
+     * @returns {boolean} true=成功获取锁，false=被拒绝（已放入pending队列）
+     */
+    _acquireBehaviorLock(type, priority, callback) {
+        // 无锁时直接获取
+        if (!this._currentBehaviorLock) {
+            this._currentBehaviorLock = {
+                type: type,
+                priority: priority,
+                startTime: this.game ? this.game.gameTime : Date.now()
+            };
+            this._logDebug('override', `[行为锁] 获取锁: ${type}(优先级${priority})`);
+            return true;
+        }
+
+        // 新行为优先级更高，抢占
+        if (priority > this._currentBehaviorLock.priority) {
+            const oldType = this._currentBehaviorLock.type;
+            const oldPriority = this._currentBehaviorLock.priority;
+            this._logDebug('override', `[行为锁] 抢占: ${type}(${priority}) 替换 ${oldType}(${oldPriority})`);
+            this._currentBehaviorLock = {
+                type: type,
+                priority: priority,
+                startTime: this.game ? this.game.gameTime : Date.now()
+            };
+            return true;
+        }
+
+        // 优先级不够，放入待执行队列
+        if (callback) {
+            // 检查队列中是否已有同类型行为
+            const existing = this._pendingBehaviors.findIndex(b => b.type === type);
+            if (existing >= 0) {
+                this._pendingBehaviors[existing] = { type, priority, callback };
+            } else {
+                this._pendingBehaviors.push({ type, priority, callback });
+                // 队列最多3个，超出丢弃最低优先级
+                if (this._pendingBehaviors.length > 3) {
+                    this._pendingBehaviors.sort((a, b) => b.priority - a.priority);
+                    const dropped = this._pendingBehaviors.pop();
+                    this._logDebug('override', `[行为锁] pending队列满，丢弃: ${dropped.type}(${dropped.priority})`);
+                }
+            }
+            this._logDebug('override', `[行为锁] 拒绝 ${type}(${priority})，当前锁: ${this._currentBehaviorLock.type}(${this._currentBehaviorLock.priority})，放入pending`);
+        } else {
+            this._logDebug('override', `[行为锁] 拒绝 ${type}(${priority})，当前锁: ${this._currentBehaviorLock.type}(${this._currentBehaviorLock.priority})`);
+        }
+        return false;
+    }
+
+    /**
+     * 释放行为锁，并自动执行pending队列中最高优先级的行为
+     * @param {string} expectedType - 期望释放的行为类型（安全校验，防止误释放）
+     * @returns {boolean} true=释放成功
+     */
+    _releaseBehaviorLock(expectedType) {
+        if (!this._currentBehaviorLock) {
+            return false;
+        }
+        if (expectedType && this._currentBehaviorLock.type !== expectedType) {
+            this._logDebug('override', `[行为锁] 释放失败: 期望${expectedType}，实际${this._currentBehaviorLock.type}`);
+            return false;
+        }
+        const releasedType = this._currentBehaviorLock.type;
+        this._currentBehaviorLock = null;
+        this._logDebug('override', `[行为锁] 释放锁: ${releasedType}`);
+
+        // 自动执行pending队列中最高优先级的行为
+        this._executePendingBehavior();
+        return true;
+    }
+
+    /**
+     * 执行pending队列中最高优先级的行为
+     */
+    _executePendingBehavior() {
+        if (this._pendingBehaviors.length === 0) return;
+
+        // 按优先级排序，取最高的
+        this._pendingBehaviors.sort((a, b) => b.priority - a.priority);
+        const next = this._pendingBehaviors.shift();
+        this._logDebug('override', `[行为锁] 从pending队列执行: ${next.type}(${next.priority})`);
+
+        if (next.callback && typeof next.callback === 'function') {
+            try {
+                next.callback();
+            } catch (e) {
+                console.warn(`[行为锁] pending回调执行失败: ${next.type}`, e);
+            }
+        }
+    }
+
+    /**
+     * 检查当前是否持有行为锁
+     * @returns {boolean}
+     */
+    _hasBehaviorLock() {
+        return this._currentBehaviorLock !== null;
+    }
+
+    /**
+     * 获取当前行为锁的优先级
+     * @returns {number} 当前锁优先级，无锁返回-1
+     */
+    _getBehaviorLockPriority() {
+        return this._currentBehaviorLock ? this._currentBehaviorLock.priority : -1;
+    }
+
+    /**
+     * 获取当前行为锁的类型
+     * @returns {string|null}
+     */
+    _getBehaviorLockType() {
+        return this._currentBehaviorLock ? this._currentBehaviorLock.type : null;
+    }
+
+    /**
+     * 获取P0紧急层的动态阈值（根据当前行为锁优先级调整）
+     * @returns {{ healthThreshold: number, staminaThreshold: number, tempThreshold: number }}
+     */
+    _getP0Thresholds() {
+        const lockPriority = this._getBehaviorLockPriority();
+        if (lockPriority >= BEHAVIOR_PRIORITY.BASIC_NEED) {
+            // 正在吃饭/睡觉/治疗中，阈值收紧
+            return {
+                healthThreshold: 10,    // 从<20收紧到<10
+                staminaThreshold: 5,    // 从<20收紧到<5
+                tempThreshold: 35       // 体温维持<35°C不变
+            };
+        }
+        // 无锁或低优先级锁，使用原始阈值
+        return {
+            healthThreshold: 20,
+            staminaThreshold: 20,
+            tempThreshold: 35
+        };
+    }
+
+    /**
+     * 行为锁超时安全网检查（在update头部调用）
+     * 防止因bug导致NPC永久卡在某个行为中
+     */
+    _checkBehaviorLockTimeout() {
+        if (!this._currentBehaviorLock || !this.game) return;
+        const elapsed = this.game.gameTime - this._currentBehaviorLock.startTime;
+        if (elapsed > 120) { // 120秒游戏时间
+            const lockType = this._currentBehaviorLock.type;
+            const lockPriority = this._currentBehaviorLock.priority;
+            console.warn(`[行为锁超时] ${this.name} 行为锁 ${lockType}(${lockPriority}) 持续${elapsed.toFixed(0)}秒游戏时间，强制释放`);
+            this._logDebug('override', `[行为锁超时] ${lockType}(${lockPriority}) 持续${elapsed.toFixed(0)}秒，强制释放`);
+            this._currentBehaviorLock = null;
+            // 清空pending队列中过期的行为
+            this._pendingBehaviors = [];
+        }
     }
 
     getSortY() { return this.y + TILE - 2; }
@@ -890,8 +1095,17 @@ this.affinity = { qing_xuan: 72 };
         }
     }
 
+    /** 是否正处于休息缓冲期 */
+    get isRestingCooldown() { return this._restCooldownTimer > 0; }
+
     // ---- 更新 ----
     update(dt, game) {
+        // 【死亡短路】死亡NPC跳过全部行为逻辑
+        if (this.isDead) return;
+
+        // 【行为锁超时安全网】防止因bug导致NPC永久卡在某个行为中
+        this._checkBehaviorLockTimeout();
+
         // 【场景一致性校验】确保NPC的currentScene在已知场景列表中，否则重置到village
         if (game && game.maps) {
             if (!game.maps[this.currentScene]) {
@@ -924,12 +1138,73 @@ this.affinity = { qing_xuan: 72 };
         // 冷却计时器递减
         if (this._noOneFoundCooldown > 0) this._noOneFoundCooldown -= dt;
         if (this._hungerTriggerCooldown > 0) this._hungerTriggerCooldown -= dt;
+        // 【进屋保护期递减】
+        if (this._indoorEntryProtection > 0) this._indoorEntryProtection -= dt;
+        // 【进屋保护期递减】
+        if (this._indoorEntryProtection > 0) this._indoorEntryProtection -= dt;
+
+        // 【休息缓冲期递减】缓冲期结束时恢复日程接管
+        // 【行为锁优化】改为条件驱动：体力>=40或经过60秒游戏时间
+        if (this._restCooldownTimer > 0) {
+            this._restCooldownTimer -= dt;
+            // 【硬保护B4】缓冲期内渐进恢复体力（每秒+2）
+            this.stamina = Math.min(100, this.stamina + 2 * dt);
+            // 【边界保护】极度饥饿(hunger<10)可以穿透休息缓冲期
+            if (this.hunger < 10) {
+                console.log(`[饥饿穿透] ${this.name} 休息缓冲期中极度饥饿(${Math.round(this.hunger)})，穿透缓冲期去吃饭`);
+                this._logDebug('override', `[饥饿穿透] 极度饥饿(${Math.round(this.hunger)})穿透休息缓冲期`);
+                this._restCooldownTimer = 0;
+                this._clearActionOverride();
+                this._releaseBehaviorLock('resting');
+                this._triggerHungerBehavior(game);
+            }
+            const restDone = this._restCooldownTimer <= 0 || this.stamina >= 40;
+            if (restDone) {
+                const reason = this.stamina >= 40 ? `体力恢复到${Math.round(this.stamina)}` : `缓冲期到期`;
+                this._restCooldownTimer = 0;
+                console.log(`[休息结束] ${this.name} ${reason}，检查后续行为`);
+                this._logDebug('override', `[休息完毕] ${reason}`);
+                this.stateDesc = '休息完毕';
+                this._clearActionOverride();
+                this._releaseBehaviorLock('resting'); // 释放休息行为锁
+                // 【硬保护B4】缓冲期结束后自动检查饥饿状态
+                if (this.hunger < 35) {
+                    console.log(`[休息→吃饭] ${this.name} 休息完毕但饥饿(${Math.round(this.hunger)})，自动触发饮食行为`);
+                    this._logDebug('override', `[休息→吃饭] 休息后饥饿(${Math.round(this.hunger)})，触发饮食`);
+                    this._triggerHungerBehavior(game);
+                } else {
+                    this.currentScheduleIdx = -1;
+                    this.scheduleReached = false;
+                    console.log(`[休息结束] ${this.name} 体力充足且不饥，日程系统恢复接管`);
+                }
+            }
+        }
 
         // 【吵架冷淡期递减】冷淡期内不会被动增加好感度
         if (this._affinityCooldown) {
             for (const id in this._affinityCooldown) {
                 if (this._affinityCooldown[id] > 0) {
                     this._affinityCooldown[id] -= dt;
+                }
+            }
+        }
+
+        // 【老钱被动光环】镇长讲话 - 当老钱在暖炉广场且同场景存活NPC≥3人时，自动为在场NPC恢复San值
+        if (this.id === 'old_qian' && !this.isDead && game && game.npcs) {
+            // 判断老钱是否在暖炉广场（village场景的furnace_plaza区域，或直接用currentScene判断）
+            const isAtFurnacePlaza = this.currentScene === 'village' && 
+                this.x >= 20 * TILE && this.x <= 30 * TILE && this.y >= 18 * TILE && this.y <= 26 * TILE;
+            if (isAtFurnacePlaza) {
+                const sameSceneAlive = game.npcs.filter(n => 
+                    n.id !== this.id && !n.isDead && n.currentScene === this.currentScene
+                );
+                if (sameSceneAlive.length >= 3) {
+                    // 每秒为在场NPC恢复+0.03 San值（纯被动，不依赖安抚工作状态）
+                    for (const npc of sameSceneAlive) {
+                        if (npc.sanity < 100) {
+                            npc.sanity = Math.min(100, npc.sanity + 0.03 * dt);
+                        }
+                    }
                 }
             }
         }
@@ -953,6 +1228,9 @@ this.affinity = { qing_xuan: 72 };
         // 行动实效性系统更新（让日程行为产生实际效果）
         this._updateActionEffect(dt, game);
 
+        // 【新增】全局急救包自动使用检查（独立于medical_heal，每帧执行）
+        this._checkAutoMedkit(dt, game);
+
         // 饥饿系统更新
         this._updateHunger(dt, game);
 
@@ -964,26 +1242,45 @@ this.affinity = { qing_xuan: 72 };
             this.sleepZTimer += dt;
             this.isMoving = false;
             this.animFrame = 0;
-            return;
+            // 【强制睡眠计时】累加强制睡眠持续时间
+            if (this._forcedSleep) {
+                this._forcedSleepTimer += dt;
+            }
+            // 【行为锁保护】睡眠期间仅致命紧急(health<10 || bodyTemp<33)才允许唤醒
+            // P0层穿透检查：如果有致命紧急情况，不返回，让后续逻辑处理
+            const fatalDuringSleep = (this.health < 10) || (this.bodyTemp !== undefined && this.bodyTemp < 33);
+            if (!fatalDuringSleep) {
+                return; // 非致命情况，继续睡觉
+            }
+            // 致命紧急，允许穿透到后续逻辑（不返回），同时清除强制睡眠标记
+            if (this._forcedSleep) {
+                this._forcedSleep = false;
+                this._forcedSleepTimer = 0;
+                this._logDebug('sleep', `[强制睡眠] 致命紧急穿透强制睡眠`);
+            }
+            this._logDebug('override', `[行为锁] 睡眠中触发致命紧急(健康${Math.round(this.health)},体温${this.bodyTemp?.toFixed(1)})，允许唤醒`);
         }
 
         // 状态驱动行为覆盖（疲劳回家、生病看病、精神差求助）
         this._updateStateOverride(dt, game);
 
-        // 【v2.0-任务7】资源紧急时强制结束聊天
+        // 资源采集覆盖（木柴/食物紧缺时自动派去采集）
+        this._checkResourceGatherNeed(game);
+        this._updateResourceGatherOverride(dt, game);
+
+        // 【v2.0-优化】资源紧张时强制结束聊天（基于 tension 统一判断）
         if (this.state === 'CHATTING' && game && game.resourceSystem) {
             if (!this._chatUrgencyCheckTimer) this._chatUrgencyCheckTimer = 0;
             this._chatUrgencyCheckTimer += dt;
             if (this._chatUrgencyCheckTimer >= 5) { // 每5秒检查一次
                 this._chatUrgencyCheckTimer = 0;
-                const urgency = game.resourceSystem.getResourceUrgency();
-                const hasCritical = urgency.wood === 'critical' || urgency.food === 'critical' || urgency.power === 'critical';
-                if (hasCritical) {
+                const tension = game.resourceSystem.getResourceTension();
+                if (tension >= 0.5) {
                     this._forceEndChat();
                     if (game.addEvent) {
-                        game.addEvent(`⚡ ${this.name}因资源紧急停止聊天，准备执行任务！`);
+                        game.addEvent(`⚡ ${this.name}因资源紧张（${(tension * 100).toFixed(0)}%）停止聊天，前往工作！`);
                     }
-                    this._logDebug('chat', '资源critical，强制结束聊天');
+                    this._logDebug('chat', `资源紧张度${tension.toFixed(2)}>=0.5，强制结束聊天`);
                 }
             }
         }
@@ -1260,6 +1557,23 @@ this.affinity = { qing_xuan: 72 };
     _updateSleepState(game) {
         const hour = game.getHour();
         
+        // 【兜底硬保护】NPC在village(户外)绝对不能处于睡眠状态
+        if (this.isSleeping && this.currentScene === 'village') {
+            console.warn(`[户外睡觉兜底] ${this.name} 在village处于isSleeping状态，强制清除并导航回家`);
+            this.isSleeping = false;
+            this.state = 'IDLE';
+            this._forcedSleep = false;
+            // 强制导航回家
+            const homeDoorKey = this.homeName + '_door';
+            const homeDoorLoc = SCHEDULE_LOCATIONS[homeDoorKey];
+            if (homeDoorLoc && !this.isMoving && this.currentPath.length === 0) {
+                this._pendingEnterScene = this.homeName;
+                this._pendingEnterKey = homeDoorKey;
+                this._pathTo(homeDoorLoc.x, homeDoorLoc.y, this.game);
+            }
+            return;
+        }
+        
         // 找到当前时段的日程
         const sched = this.scheduleTemplate;
         let currentAction = null;
@@ -1271,9 +1585,12 @@ this.affinity = { qing_xuan: 72 };
             }
         }
 
-        // 判断是否该睡觉：日程描述包含"休息"或"睡觉"，且NPC已到达家里
-        const isSleepAction = currentAction && 
-            (currentAction.desc.includes('休息') || currentAction.desc.includes('睡觉'));
+        // 判断是否该睡觉：必须是STAY动作且target包含_bed_（精确匹配床位日程）
+        // 避免WALK_TO + "准备休息"类日程误触发入睡
+        const isSleepAction = currentAction && (
+            (currentAction.action === 'STAY' && currentAction.target && currentAction.target.includes('_bed_')) ||
+            (currentAction.action === 'STAY' && currentAction.desc && currentAction.desc.includes('休息') && currentAction.desc.includes('睡觉'))
+        );
         const shouldSleep = isSleepAction && this._isAtHome();
 
         // 【修复】深夜了(23点~6点)，如果NPC还在外面且处于饥饿覆盖状态，
@@ -1312,6 +1629,19 @@ this.affinity = { qing_xuan: 72 };
         }
 
         if (shouldSleep && !this.isSleeping && this.state !== 'CHATTING') {
+            // 【硬保护】绝对不能在village(户外)入睡！必须在室内场景
+            if (this.currentScene === 'village') {
+                console.warn(`[户外入睡阻止] ${this.name} 在village(户外)触发入睡条件但被阻止，强制导航回家`);
+                // 强制导航回宿舍
+                const homeDoorKey = this.homeName + '_door';
+                const homeDoorLoc = SCHEDULE_LOCATIONS[homeDoorKey];
+                if (homeDoorLoc && !this.isMoving && this.currentPath.length === 0) {
+                    this._pendingEnterScene = this.homeName;
+                    this._pendingEnterKey = homeDoorKey;
+                    this._pathTo(homeDoorLoc.x, homeDoorLoc.y, this.game);
+                }
+                return; // 不入睡
+            }
             // 【修复】入睡时强制修正坐标到床位位置
             const bedLoc = SCHEDULE_LOCATIONS[this.homeName + '_inside'];
             if (bedLoc) {
@@ -1325,17 +1655,72 @@ this.affinity = { qing_xuan: 72 };
             this.isMoving = false;
             this.expression = '';
             this._logDebug('sleep', `开始睡觉(日程) 体力:${Math.round(this.stamina)} San:${Math.round(this.sanity)}`);
+            // AI模式日志：入睡
+            if (this.game && this.game.aiModeLogger) {
+                const snap = AIModeLogger.npcAttrSnapshot(this);
+                this.game.aiModeLogger.log('SLEEP_START', `${this.name} 开始睡觉(日程) | ${snap} | ${this.currentScene || '?'}`);
+            }
         } else if (!shouldSleep && this.isSleeping) {
-            // 起床了
+            // 【修复】防震荡保护：如果当前时间仍在0-6点睡觉时段且NPC在家中，
+            // 可能是日切换导致的单帧震荡，不起床
+            const wakeHour = game.getHour();
+            if (this._dayChangeWhileSleeping && wakeHour >= 0 && wakeHour < 6 && this._isAtHome()) {
+                // 日切换震荡，强制维持睡眠状态
+                this._logDebug('sleep', `[防震荡] 日切换后0-6点仍在家中，忽略起床信号 hour:${wakeHour}`);
+                this._dayChangeWhileSleeping = false; // 消耗标记
+                return; // 不起床
+            }
+            // 【强制睡眠保护】体力不支/白天休息强制入睡时，不受日程驱动的起床影响
+            if (this._forcedSleep) {
+                const staminaOk = this.stamina >= 40;
+                const timeoutOk = this._forcedSleepTimer > 7200; // 游戏内2小时安全超时
+                const fatalOverride = (this.health < 10) || (this.bodyTemp !== undefined && this.bodyTemp < 33);
+                if (!staminaOk && !timeoutOk && !fatalOverride) {
+                    // 强制睡眠尚未恢复，阻止起床
+                    this._logDebug('sleep', `[强制睡眠] 阻止起床 体力:${Math.round(this.stamina)} 已睡:${Math.round(this._forcedSleepTimer)}s`);
+                    return; // 不起床
+                }
+                // 强制睡眠条件满足，允许起床并清除标记
+                const reason = fatalOverride ? '致命紧急穿透' : staminaOk ? `体力恢复到${Math.round(this.stamina)}` : `安全超时(${Math.round(this._forcedSleepTimer)}s)`;
+                this._logDebug('sleep', `[强制睡眠结束] ${reason}`);
+                this._forcedSleep = false;
+                this._forcedSleepTimer = 0;
+                // 标记本次起床是强制睡眠恢复，用于后续stateDesc判断
+                this._wasForcedSleep = true;
+            }
+            // 正常起床
+            this._dayChangeWhileSleeping = false;
+            // AI模式日志：醒来（在isSleeping置false之前记录，便于对比入睡值）
+            if (this.game && this.game.aiModeLogger) {
+                const snap = AIModeLogger.npcAttrSnapshot(this);
+                this.game.aiModeLogger.log('SLEEP_END', `${this.name} 醒来 | ${snap} | ${this.currentScene || '?'}`);
+            }
             this.isSleeping = false;
             this.state = 'IDLE';
             this.mood = '平静';
-            this.stateDesc = '刚起床';
-            this.expression = '新的一天开始了~';
+            // 【修复B2】根据起床原因和时间设置合理的stateDesc和expression
+            if (this._wasForcedSleep) {
+                // 强制睡眠恢复后的描述
+                this.stateDesc = '休息好了';
+                this.expression = '精神好多了';
+                this._wasForcedSleep = false;
+            } else if (wakeHour >= 5 && wakeHour < 9) {
+                // 早上5-9点：正常起床
+                this.stateDesc = '刚起床';
+                this.expression = '新的一天开始了~';
+            } else if (wakeHour >= 9 && wakeHour < 18) {
+                // 白天9-18点：小憩醒来
+                this.stateDesc = '小憩醒来';
+                this.expression = '精神好了一些';
+            } else {
+                // 夜间18-24点或0-5点
+                this.stateDesc = '醒了过来';
+                this.expression = '醒了...';
+            }
             this.expressionTimer = 5;
             this.sleepZTimer = 0;
             if (game.addEvent) {
-                game.addEvent(`🌅 ${this.name} 起床了`);
+                game.addEvent(`🌅 ${this.name} ${this.stateDesc}`);
             }
         }
     }
@@ -1418,17 +1803,7 @@ this.affinity = { qing_xuan: 72 };
         // 截断过长的描述
         if (intent.length > 16) intent = intent.substring(0, 15) + '…';
 
-        // 【调试增强】覆盖系统状态标识
-        let debugFlags = '';
-        if (this._actionOverride) debugFlags += '[AO]';
-        if (this._stateOverride) debugFlags += `[SO:${this._stateOverride}]`;
-        if (this._hungerOverride) debugFlags += '[HO]';
-        if (this._priorityOverride) debugFlags += `[PO:${this._priorityOverride}]`;
-        if (this.scheduleReached) debugFlags += '[SR]';
-        if (this._taskOverride && this._taskOverride.isActive) debugFlags += `[T:${this._taskOverride.targetLocation || '?'}]`;
-        if (this._idleWatchdogTimer > 3) debugFlags += `[IDLE:${Math.round(this._idleWatchdogTimer)}s]`;
-
-        return `📍${loc}${intent ? ' · ' + intent : ''}${debugFlags ? ' ' + debugFlags : ''}`;
+        return `📍${loc}${intent ? ' · ' + intent : ''}`;
     }
 
     // ---- 下雨避雨 ----
@@ -1519,6 +1894,11 @@ this.affinity = { qing_xuan: 72 };
                 this._priorityOverride = 'day4_lockdown';
                 this.stateDesc = '大极寒！紧急返回室内';
                 this._logDebug('schedule', `[P0] 第4天室外锁定，返回${homeDoor}`);
+                // AI模式日志：P0紧急返回
+                if (this.game && this.game.aiModeLogger) {
+                    const snap = AIModeLogger.npcAttrSnapshot(this);
+                    this.game.aiModeLogger.log('EMERGENCY', `${this.name} [P0]第4天室外锁定,紧急返回室内 | ${snap}`);
+                }
                 this._navigateToScheduleTarget(homeDoor, game);
             }
             // P0同时暂停taskOverride中的户外任务
@@ -1536,29 +1916,47 @@ this.affinity = { qing_xuan: 72 };
                 this._priorityOverride = 'hypothermia';
                 this.stateDesc = '体温过低！紧急返回暖炉';
                 this._logDebug('schedule', `[P0] 体温${this.bodyTemp.toFixed(1)}°C，紧急返回暖炉`);
+                // AI模式日志：P0体温过低紧急返回
+                if (this.game && this.game.aiModeLogger) {
+                    const snap = AIModeLogger.npcAttrSnapshot(this);
+                    this.game.aiModeLogger.log('EMERGENCY', `${this.name} [P0]体温${this.bodyTemp.toFixed(1)}°C,紧急返回暖炉 | ${snap}`);
+                }
                 // 【增强】体温<34°C时，优先寻找最近的室内建筑入口，而不是只去暖炉
+                // 【修复】兜底目标改为宿舍而非户外暖炉广场
+                const hypoTarget = this.homeName + '_door';
                 if (this.bodyTemp < 34) {
                     const nearestDoor = this._findNearestIndoorDoor(game);
                     if (nearestDoor) {
                         this._logDebug('schedule', `[P0] 体温极低(${this.bodyTemp.toFixed(1)}°C)，紧急前往最近室内入口: ${nearestDoor.key}`);
                         this._navigateToScheduleTarget(nearestDoor.key, game);
                     } else {
-                        this._navigateToScheduleTarget('furnace_plaza', game);
+                        this._navigateToScheduleTarget(hypoTarget, game);
                     }
                 } else {
-                    this._navigateToScheduleTarget('furnace_plaza', game);
+                    const nearestDoor2 = this._findNearestIndoorDoor(game);
+                    if (nearestDoor2) {
+                        this._navigateToScheduleTarget(nearestDoor2.key, game);
+                    } else {
+                        this._navigateToScheduleTarget(hypoTarget, game);
+                    }
                 }
             } else if (!this.isMoving && this.currentPath.length === 0) {
                 // 【防卡住兜底】已处于hypothermia但NPC不在移动，重新导航
+                const hypoTarget2 = this.homeName + '_door';
                 if (this.bodyTemp < 34) {
                     const nearestDoor = this._findNearestIndoorDoor(game);
                     if (nearestDoor) {
                         this._navigateToScheduleTarget(nearestDoor.key, game);
                     } else {
-                        this._navigateToScheduleTarget('furnace_plaza', game);
+                        this._navigateToScheduleTarget(hypoTarget2, game);
                     }
                 } else {
-                    this._navigateToScheduleTarget('furnace_plaza', game);
+                    const nearestDoor2 = this._findNearestIndoorDoor(game);
+                    if (nearestDoor2) {
+                        this._navigateToScheduleTarget(nearestDoor2.key, game);
+                    } else {
+                        this._navigateToScheduleTarget(hypoTarget2, game);
+                    }
                 }
             }
             // P0同时暂停taskOverride
@@ -1569,17 +1967,37 @@ this.affinity = { qing_xuan: 72 };
             return;
         }
 
-        // P0-3: 健康危急 — 健康<20时前往暖炉休息
-        if (this.health < 20 && this.currentScene !== 'medical') {
+        // P0-3: 健康危急 — 使用动态阈值（行为锁下收紧）
+        // 【行为锁优化】正在吃饭/睡觉/治疗时，阈值从<20收紧到<10
+        const p0t = this._getP0Thresholds();
+        if (this.health < p0t.healthThreshold && this.currentScene !== 'medical') {
+            // 【行为锁】如果当前行为即将完成(5秒内)，等待完成后再触发P0
+            if (this.isEating && this.eatingTimer > 0 && this.eatingTimer < 5) {
+                this._logDebug('schedule', `[P0] 健康${Math.round(this.health)}但吃饭即将完成(${this.eatingTimer.toFixed(1)}s)，等待完成`);
+                return; // 等吃完再触发
+            }
+            if (this.isSleeping) {
+                if (this.health >= 10) {
+                    return; // 睡觉中health>=10，不打断睡眠
+                }
+                console.warn(`[NPC-${this.name}] [异常] NPC在睡觉时段被P0驱动出门 health:${Math.round(this.health)}`);
+            }
             this._behaviorPriority = 'P0';
+            // 【修复】健康危急导航到宿舍而非户外暖炉广场，避免NPC站在户外无法恢复
+            const healthTarget = this.homeName + '_door';
             if (this._priorityOverride !== 'health_critical') {
                 this._priorityOverride = 'health_critical';
-                this.stateDesc = '健康危急！前往暖炉休息';
-                this._logDebug('schedule', `[P0] 健康${Math.round(this.health)}，紧急前往暖炉`);
-                this._navigateToScheduleTarget('furnace_plaza', game);
+                this.stateDesc = '健康危急！赶紧回家休息';
+                this._logDebug('schedule', `[P0] 健康${Math.round(this.health)}，紧急回宿舍`);
+                // AI模式日志：P0健康危急
+                if (this.game && this.game.aiModeLogger) {
+                    const snap = AIModeLogger.npcAttrSnapshot(this);
+                    this.game.aiModeLogger.log('EMERGENCY', `${this.name} [P0]健康${Math.round(this.health)},紧急回宿舍 | ${snap}`);
+                }
+                this._navigateToScheduleTarget(healthTarget, game);
             } else if (!this.isMoving && this.currentPath.length === 0) {
                 // 【防卡住兜底】已处于health_critical但NPC不在移动，重新导航
-                this._navigateToScheduleTarget('furnace_plaza', game);
+                this._navigateToScheduleTarget(healthTarget, game);
             }
             // P0同时暂停taskOverride
             if (this._taskOverride.isActive) {
@@ -1589,30 +2007,69 @@ this.affinity = { qing_xuan: 72 };
             return;
         }
 
-        // P0-4: 体力<20时暂停任务覆盖，前往暖炉休息
-        if (this.stamina < 20 && this._taskOverride.isActive) {
+        // P0-4: 体力不支时暂停任务覆盖，前往宿舍休息
+        // 【复合需求仲裁】极度饥饿时跳过体力不支，让饥饿系统处理
+        // 【修复】饱腹<15时无论体力多少都优先吃饭（不能饿着肚子去睡觉）
+        // 【修复】睡觉中的NPC不触发体力不足出门（宿舍内本身就在恢复体力）
+        if (this.hunger < 15) {
+            // 饱腹极低（<15）：优先吃饭，跳过体力不支判断，让饥饿系统处理
+            // 不能饿着肚子去睡觉，吃饭只需8秒很快就能完成
+        } else if (this.hunger < 35 && this.stamina < 15) {
+            // 都比较低时优先吃饭（吃饭只需8秒更快完成）
+            // 跳过stamina_critical，让饥饿系统处理
+        } else if (this.isSleeping && this.stamina < p0t.staminaThreshold) {
+            // 睡觉中体力低不出门，静默跳过（宿舍内睡觉本身就在恢复体力）
+            return;
+        }
+        // 【修复】正在吃饭或前往吃饭途中，不触发体力不支（让NPC先吃完再去休息）
+        if (this.stamina < p0t.staminaThreshold && (this.isEating || this._hungerOverride)) {
+            // 吃饭中/前往吃饭中，不打断
+            return;
+        }
+        if (this.stamina < p0t.staminaThreshold && this._taskOverride.isActive) {
+            // 【行为锁】如果当前行为即将完成(5秒内)，等待完成后再触发P0
+            if (this.isEating && this.eatingTimer > 0 && this.eatingTimer < 5) {
+                this._logDebug('schedule', `[P0] 体力${Math.round(this.stamina)}但吃饭即将完成(${this.eatingTimer.toFixed(1)}s)，等待完成`);
+                return;
+            }
             this._behaviorPriority = 'P0';
             this._taskOverride.isActive = false;
+            // 【修复】体力不支导航到宿舍而非户外暖炉广场，避免NPC站在户外无法恢复
+            const staminaTarget = this.homeName + '_door';
             if (this._priorityOverride !== 'stamina_critical') {
                 this._priorityOverride = 'stamina_critical';
-                this.stateDesc = '体力不支！暂停任务回暖炉休息';
-                this._logDebug('schedule', `[P0] 体力${Math.round(this.stamina)}，暂停任务回暖炉`);
-                this._navigateToScheduleTarget('furnace_plaza', game);
+                this.stateDesc = '体力不支！赶紧回家休息';
+                this._logDebug('schedule', `[P0] 体力${Math.round(this.stamina)}，暂停任务回宿舍`);
+                // AI模式日志：P0体力不支
+                if (this.game && this.game.aiModeLogger) {
+                    const snap = AIModeLogger.npcAttrSnapshot(this);
+                    this.game.aiModeLogger.log('EMERGENCY', `${this.name} [P0]体力${Math.round(this.stamina)},暂停任务回宿舍 | ${snap}`);
+                }
+                this._navigateToScheduleTarget(staminaTarget, game);
             } else if (!this.isMoving && this.currentPath.length === 0) {
                 // 【防卡住兜底】已处于stamina_critical但NPC不在移动，说明导航被中断，重新导航
-                this._logDebug('schedule', `[P0] 体力不支且NPC静止，重新导航暖炉`);
-                this._navigateToScheduleTarget('furnace_plaza', game);
+                this._logDebug('schedule', `[P0] 体力不支且NPC静止，重新导航宿舍`);
+                this._navigateToScheduleTarget(staminaTarget, game);
             }
             return;
         }
 
         // P0-5: 医疗需求 — 健康<30时前往医疗站
+        // 【修复】睡觉中的NPC只有health<10才打断睡眠去医疗站
         if (this.health < 30 && this.currentScene !== 'medical') {
+            if (this.isSleeping && this.health >= 10) {
+                return; // 睡觉中health>=10，不打断睡眠去医疗站
+            }
             this._behaviorPriority = 'P0';
             if (this._priorityOverride !== 'medical_urgent') {
                 this._priorityOverride = 'medical_urgent';
                 this.stateDesc = '健康危急！前往医疗站';
                 this._logDebug('schedule', `[P0] 健康${Math.round(this.health)}，前往医疗站`);
+                // AI模式日志：P0医疗需求
+                if (this.game && this.game.aiModeLogger) {
+                    const snap = AIModeLogger.npcAttrSnapshot(this);
+                    this.game.aiModeLogger.log('EMERGENCY', `${this.name} [P0]健康${Math.round(this.health)},前往医疗站 | ${snap}`);
+                }
                 this._navigateToScheduleTarget('medical_door', game);
             }
             return;
@@ -1627,8 +2084,9 @@ this.affinity = { qing_xuan: 72 };
                 if (this._priorityOverride !== 'day2_return') {
                     this._priorityOverride = 'day2_return';
                     this.stateDesc = '户外超时2小时，必须返回室内';
-                    this._logDebug('schedule', `[P0] 第2天户外超时，强制返回`);
-                    this._navigateToScheduleTarget('furnace_plaza', game);
+                    this._logDebug('schedule', `[P0] 第2天户外超时，强制返回宿舍`);
+                    // 【修复】导航到宿舍而非户外暖炉广场
+                    this._navigateToScheduleTarget(this.homeName + '_door', game);
                 }
                 return;
             }
@@ -1650,6 +2108,13 @@ this.affinity = { qing_xuan: 72 };
                 const clearedType = this._priorityOverride;
                 this._priorityOverride = null;
                 this._logDebug('schedule', `[P0] 优先级覆盖(${clearedType})已清除，恢复正常行为`);
+                // 【行为锁】P0恢复后检查是否仍在就寝时段，如果是则导航回宿舍继续睡觉
+                const curHour = game.getHour();
+                if (this._isBedtime(curHour) && !this.isSleeping) {
+                    this._logDebug('schedule', `[P0恢复] 仍在就寝时段(${curHour}时)，导航回宿舍继续睡觉`);
+                    this._navigateToScheduleTarget(this.homeName + '_door', game);
+                    return;
+                }
                 // P0恢复后自动重启被暂停的任务
                 if (this._taskOverride.targetLocation && this._taskOverride.taskId && !this._taskOverride.isActive) {
                     this._taskOverride.isActive = true;
@@ -1666,6 +2131,18 @@ this.affinity = { qing_xuan: 72 };
 
         // ========== P1: 任务驱动覆盖层 ==========
         // 当_taskOverride激活时，跳过P2日程，导航到任务目标位置
+
+        // 【一致性检查】饥饿覆盖和任务覆盖不能同时存在
+        if (this._hungerOverride && this._taskOverride && this._taskOverride.isActive) {
+            console.log(`[一致性] ${this.name} 饥饿覆盖与任务覆盖同时存在，强制取消任务覆盖`);
+            this.deactivateTaskOverride();
+        }
+
+        // 【一致性检查】饥饿覆盖和任务覆盖不能同时存在
+        if (this._hungerOverride && this._taskOverride && this._taskOverride.isActive) {
+            console.log(`[一致性] ${this.name} 饥饿覆盖与任务覆盖同时存在，强制取消任务覆盖`);
+            this.deactivateTaskOverride();
+        }
 
         // P1-1: 任务覆盖激活检测
         if (this._taskOverride.isActive && this._taskOverride.targetLocation) {
@@ -1692,6 +2169,12 @@ this.affinity = { qing_xuan: 72 };
 
         // ========== P2: 日程默认层 ==========
         this._behaviorPriority = 'P2';
+
+        // 【修复】睡眠全局保护：NPC在睡觉中时跳过P2层几乎所有逻辑
+        // 仅在真正致命情况（体温<33°C、健康<10）才允许P0穿透（已在上面P0层处理）
+        if (this.isSleeping && this.health >= 10 && (this.bodyTemp === undefined || this.bodyTemp >= 33)) {
+            return; // 睡觉中，跳过日程执行、饥饿检查、状态覆盖等所有P2逻辑
+        }
 
         // 【饥饿系统】检查是否到达吃饭地点（每帧都检测）
         this._checkEatingArrival(dt, game);
@@ -1769,6 +2252,30 @@ this.affinity = { qing_xuan: 72 };
             } else if (this._chatWalkTarget) {
                 // 【修复】社交走路中，仅记录日程变化，不干预（防止日程打断走向聊天目标的路径）
                 this._logDebug('schedule', `日程切换到#${targetIdx}但正在走向聊天目标，不干预`);
+            } else if (this.isSleeping) {
+                // 【修复】NPC正在睡觉时日程切换：判断新日程是否也是睡觉日程
+                // 如果是（如22-24点切换到0-6点），只更新索引不打断睡眠
+                const newSched = targetIdx >= 0 ? sched[targetIdx] : null;
+                const isNewSchedSleep = newSched && (
+                    (newSched.action === 'STAY' && newSched.target && newSched.target.includes('_bed_')) ||
+                    (newSched.action === 'STAY' && newSched.desc && newSched.desc.includes('休息') && newSched.desc.includes('睡觉'))
+                );
+                if (isNewSchedSleep) {
+                    // 新日程也是睡觉日程，平滑延续睡眠，不重置scheduleReached
+                    this.scheduleReached = true; // 标记已到达（NPC已在床上）
+                    this.stateDesc = newSched.desc;
+                    this._logDebug('schedule', `日程切换到#${targetIdx}:${newSched.desc} 睡眠中平滑过渡，不重新导航`);
+                } else {
+                    // 新日程不是睡觉日程（如6点以后的起床日程），正常处理
+                    this.scheduleReached = false;
+                    this._enterWalkTarget = null;
+                    if (targetIdx >= 0) {
+                        const rawS = sched[targetIdx];
+                        const s = this._getWeatherAdjustedEntry(rawS, game);
+                        this.stateDesc = s.desc;
+                        this._logDebug('schedule', `日程切换→#${targetIdx}:${s.desc} 目标:${s.target} (睡眠将由_updateSleepState结束)`);
+                    }
+                }
             } else {
                 this.scheduleReached = false;
                 this._enterWalkTarget = null; // 清空旧的室内走路目标
@@ -1786,8 +2293,21 @@ this.affinity = { qing_xuan: 72 };
         }
 
         // 【任务4】日程导航超时兜底：如果导航超过30秒仍未到达，强制传送
+        // 【修复】持有行为锁/吃饭/休息缓冲/前往吃饭途中时跳过超时传送
         if (targetIdx >= 0 && !this.scheduleReached && this._scheduleNavTarget) {
             this._scheduleNavTimer += dt;
+            // 行为锁保护：持有行为锁时重置计时器，不触发超时传送
+            if (this._currentBehaviorLock) {
+                this._scheduleNavTimer = 0;
+            }
+            // 吃饭/休息缓冲期保护
+            if (this.isEating || this._restCooldownTimer > 0 || this._isBeingTreated) {
+                this._scheduleNavTimer = 0;
+            }
+            // 前往吃饭途中且正在移动，不触发超时
+            if (this._hungerOverride && this.isMoving) {
+                this._scheduleNavTimer = 0;
+            }
             if (this._scheduleNavTimer > 30) {
                 const rawST = sched[targetIdx];
                 const sT = this._getWeatherAdjustedEntry(rawST, game);
@@ -1816,7 +2336,11 @@ this.affinity = { qing_xuan: 72 };
 
         // 如果日程未到达，且NPC没在移动中，可能需要重新导航
         // （处理多步传送的情况：酒馆→村庄后，还需从村庄→公寓）
-        if (targetIdx >= 0 && !this.scheduleReached && !this.isMoving && this.currentPath.length === 0 && !this.isSleeping && this.state !== 'CHATTING' && !this._hungerOverride && !this._actionOverride && !this._chatWalkTarget) {
+        // 【行为锁保护】当持有resting/sleeping行为锁时，跳过P2日程导航
+        const _lockType = this._getBehaviorLockType();
+        if (_lockType === 'resting' || _lockType === 'sleeping' || _lockType === 'eating') {
+            // 行为锁保护中，跳过P2日程导航
+        } else if (targetIdx >= 0 && !this.scheduleReached && !this.isMoving && this.currentPath.length === 0 && !this.isSleeping && this.state !== 'CHATTING' && !this._hungerOverride && !this._actionOverride && !this._chatWalkTarget) {
             const rawS = sched[targetIdx];
             const s = this._getWeatherAdjustedEntry(rawS, game);
             const loc = SCHEDULE_LOCATIONS[s.target];
@@ -1906,7 +2430,9 @@ this.affinity = { qing_xuan: 72 };
         }
 
         // 【安全网】如果日程标记为已到达，但目标是门口类（xxx_door）且NPC仍在村庄，说明进入建筑失败，先传送到室内门口再走进去
-        if (this.scheduleReached && targetIdx >= 0 && !this.isSleeping && this.state !== 'CHATTING') {
+        // 【休息缓冲期】缓冲期内跳过安全网逻辑，避免把NPC传送出去
+        if (this.scheduleReached && targetIdx >= 0 && !this.isSleeping && this.state !== 'CHATTING' && !this.isRestingCooldown
+            && !this._currentBehaviorLock && !this.isEating && !this._isBeingTreated) {
             const curTarget = this._getWeatherAdjustedEntry(sched[targetIdx], game).target;
             if (curTarget.endsWith('_door') && this.currentScene === 'village') {
                 const safetyDoorToScene = {
@@ -1947,7 +2473,10 @@ this.affinity = { qing_xuan: 72 };
         // 已到达目的地后，动态感知环境并调整状态描述
         // 【修复】CHATTING 状态下不触发环境感知，避免把正在聊天的NPC传送走
         // 【位置偏移修正】scheduleReached=true但NPC远离目标时，重新导航
-        if (this.scheduleReached && targetIdx >= 0 && !this.isSleeping && this.state !== 'CHATTING' && !this.isMoving && this.currentPath.length === 0) {
+        // 【休息缓冲期】缓冲期内跳过位置偏移修正，避免把NPC导航出去
+        if (this.scheduleReached && targetIdx >= 0 && !this.isSleeping && this.state !== 'CHATTING' && !this.isMoving && this.currentPath.length === 0 && !this.isRestingCooldown
+            && !this._currentBehaviorLock && !this.isEating && !this._isBeingTreated
+            && !this._hungerOverride && !this._stateOverride && !this._enterWalkTarget) {
             const rawSCheck = sched[targetIdx];
             const sCheck = this._getWeatherAdjustedEntry(rawSCheck, game);
             const locCheck = SCHEDULE_LOCATIONS[sCheck.target];
@@ -1997,6 +2526,42 @@ this.affinity = { qing_xuan: 72 };
         const override = this._taskOverride;
         if (!override.isActive || !override.targetLocation) return;
 
+        // 【出门过程保护】NPC正在出门时不执行任务导航
+        if (this._walkingToDoor) return;
+
+        // 【饥饿覆盖保护】饥饿覆盖中直接取消任务
+        if (this._hungerOverride) {
+            console.log(`[饥饿优先] ${this.name} 正在进食/前往进食，取消任务导航 ${override.taskId}`);
+            this.deactivateTaskOverride();
+            return;
+        }
+        // 【极度饥饿保护】hunger<15时强制取消任务
+        if (this.hunger < 15) {
+            console.log(`[极度饥饿] ${this.name} hunger=${Math.round(this.hunger)}<15，强制取消任务 ${override.taskId}`);
+            this.deactivateTaskOverride();
+            return;
+        }
+        // 【状态覆盖保护】状态覆盖中跳过任务导航
+        if (this._stateOverride) return;
+
+        // 【出门过程保护】NPC正在出门时不执行任务导航
+        if (this._walkingToDoor) return;
+
+        // 【饥饿覆盖保护】饥饿覆盖中直接取消任务
+        if (this._hungerOverride) {
+            console.log(`[饥饿优先] ${this.name} 正在进食/前往进食，取消任务导航 ${override.taskId}`);
+            this.deactivateTaskOverride();
+            return;
+        }
+        // 【极度饥饿保护】hunger<15时强制取消任务
+        if (this.hunger < 15) {
+            console.log(`[极度饥饿] ${this.name} hunger=${Math.round(this.hunger)}<15，强制取消任务 ${override.taskId}`);
+            this.deactivateTaskOverride();
+            return;
+        }
+        // 【状态覆盖保护】状态覆盖中跳过任务导航
+        if (this._stateOverride) return;
+
         let targetLoc = SCHEDULE_LOCATIONS[override.targetLocation];
         if (!targetLoc) {
             // 尝试去掉_enter后缀修正
@@ -2040,7 +2605,51 @@ this.affinity = { qing_xuan: 72 };
         }
 
         // 检查是否已到达目标场景和位置
-        if (this.currentScene === targetLoc.scene) {
+        // 【关键修复】_door类型目标需要区分：NPC站在门口(village) vs 已进入室内
+        const isDoorTarget = override.targetLocation.endsWith('_door');
+        const doorToSceneMap = {
+            warehouse_door: 'warehouse', medical_door: 'medical',
+            dorm_a_door: 'dorm_a', dorm_b_door: 'dorm_b',
+            kitchen_door: 'kitchen', workshop_door: 'workshop',
+        };
+        const targetIndoorScene = isDoorTarget ? doorToSceneMap[override.targetLocation] : null;
+
+        // 如果是_door目标且NPC已进入对应室内场景 → 真正到达
+        if (targetIndoorScene && this.currentScene === targetIndoorScene) {
+            if (!this._taskOverrideReached) {
+                this._taskOverrideReached = true;
+                this._taskOverrideStuckTimer = 0;
+                this._taskOverrideTravelTimer = 0;
+                this._logDebug('schedule', `[P1] 已进入室内${targetIndoorScene}，任务目标到达 ${override.targetLocation}`);
+                if (this.game && this.game.aiModeLogger) {
+                    const snap = AIModeLogger.npcAttrSnapshot(this);
+                    this.game.aiModeLogger.log('WORK', `${this.name} 到达任务目标(室内) ${override.targetLocation} | 任务:${override.taskId || '?'} | ${snap}`);
+                }
+            }
+            this.scheduleReached = true;
+            return;
+        }
+
+        // 如果是_door目标且NPC在village场景靠近门口 → 需要进入室内，不算到达
+        if (targetIndoorScene && this.currentScene === 'village' && this.currentScene === targetLoc.scene) {
+            const pos = this.getGridPos();
+            const dist = Math.abs(pos.x - targetLoc.x) + Math.abs(pos.y - targetLoc.y);
+            if (dist <= 4) {
+                // NPC在门口附近但未进入室内，触发进入
+                if (!this.isMoving && this.currentPath.length === 0) {
+                    console.log(`[任务导航] ${this.name} 到达${override.targetLocation}门口(dist=${dist})，触发进入室内${targetIndoorScene}`);
+                    this._logDebug('schedule', `[P1] 到达门口，触发进入室内 ${targetIndoorScene}`);
+                    this._pendingEnterScene = targetIndoorScene;
+                    this._pendingEnterKey = override.targetLocation;
+                    this._pathTo(targetLoc.x, targetLoc.y, game);
+                }
+                return; // 不标记到达，等待进入室内
+            }
+            // 距离较远，继续导航到门口
+            if (!this.isMoving && this.currentPath.length === 0) {
+                this._navigateToScheduleTarget(override.targetLocation, game);
+            }
+        } else if (this.currentScene === targetLoc.scene) {
             const pos = this.getGridPos();
             const dist = Math.abs(pos.x - targetLoc.x) + Math.abs(pos.y - targetLoc.y);
             if (dist <= 4) {
@@ -2050,6 +2659,11 @@ this.affinity = { qing_xuan: 72 };
                     this._taskOverrideStuckTimer = 0;
                     this._taskOverrideTravelTimer = 0;
                     this._logDebug('schedule', `[P1] 已到达任务目标位置 ${override.targetLocation}`);
+                    // AI模式日志：工作/采集任务到达
+                    if (this.game && this.game.aiModeLogger) {
+                        const snap = AIModeLogger.npcAttrSnapshot(this);
+                        this.game.aiModeLogger.log('WORK', `${this.name} 到达任务目标 ${override.targetLocation} | 任务:${override.taskId || '?'} | ${snap}`);
+                    }
                 }
                 // 到达后保持在位，不执行日程导航
                 this.scheduleReached = true;
@@ -2074,8 +2688,34 @@ this.affinity = { qing_xuan: 72 };
         // 卡住检测
         this._taskOverrideTravelTimer += dt;
         if (this._taskOverrideTravelTimer > 60) { // 60秒超时
+            // 【超时保护】饥饿覆盖或状态覆盖中不传送，取消任务
+            if (this._hungerOverride || this._stateOverride) {
+                console.log(`[超时保护] ${this.name} 任务超时但处于${this._hungerOverride ? '饥饿' : '状态'}覆盖中，取消任务而非传送`);
+                this.deactivateTaskOverride();
+                return;
+            }
             // 强制传送到目标位置
-            this._teleportTo(targetLoc.scene, targetLoc.x, targetLoc.y);
+            // 【修复】_door类型目标应传送到室内，而非门口
+            if (targetIndoorScene) {
+                const indoorDoorKey = targetIndoorScene + '_indoor_door';
+                const indoorDoorLoc = SCHEDULE_LOCATIONS[indoorDoorKey];
+                const insideKey = targetIndoorScene + '_inside';
+                let insideLoc = SCHEDULE_LOCATIONS[insideKey];
+                const seatLoc = this._pickIndoorSeat(targetIndoorScene, game);
+                if (seatLoc) insideLoc = { scene: targetIndoorScene, x: seatLoc.x, y: seatLoc.y };
+                if (indoorDoorLoc) {
+                    this._teleportTo(indoorDoorLoc.scene, indoorDoorLoc.x, indoorDoorLoc.y, true);
+                    if (insideLoc) {
+                        this._enterWalkTarget = { x: insideLoc.x, y: insideLoc.y };
+                        this._pathTo(insideLoc.x, insideLoc.y, game);
+                    }
+                } else if (insideLoc) {
+                    this._teleportTo(insideLoc.scene, insideLoc.x, insideLoc.y);
+                }
+                console.log(`[超时传送] ${this.name} 任务超时，传送到室内${targetIndoorScene}`);
+            } else {
+                this._teleportTo(targetLoc.scene, targetLoc.x, targetLoc.y);
+            }
             this._taskOverrideReached = true;
             this._taskOverrideTravelTimer = 0;
             this._logDebug('schedule', `[P1] 任务导航超时，强制传送到 ${override.targetLocation}`);
@@ -2093,6 +2733,27 @@ this.affinity = { qing_xuan: 72 };
         // 【防卡住】P0紧急状态下拒绝接受新任务，防止与体力不支/健康危急等状态冲突导致NPC卡住
         if (this._priorityOverride) {
             this._logDebug('schedule', `[P1] 拒绝任务 ${taskId}：当前处于P0状态(${this._priorityOverride})，等待恢复后再接受`);
+            return false;
+        }
+
+        // 【饥饿保护】NPC饥饿时不接受非urgent任务
+        if (this.hunger < 25 && priority !== 'urgent') {
+            this._logDebug('schedule', `[P1] 拒绝任务 ${taskId}：NPC饥饿(hunger=${Math.round(this.hunger)})`);
+            console.log(`[P1拒绝] ${this.name} 饥饿(${Math.round(this.hunger)})<25，拒绝非urgent任务 ${taskId}`);
+            return false;
+        }
+
+        // 【进食保护】NPC正在进食/前往进食时不接受非urgent任务
+        if (this._hungerOverride === true && priority !== 'urgent') {
+            this._logDebug('schedule', `[P1] 拒绝任务 ${taskId}：NPC正在进食/前往进食`);
+            console.log(`[P1拒绝] ${this.name} 正在进食/前往进食，拒绝非urgent任务 ${taskId}`);
+            return false;
+        }
+
+        // 【状态覆盖保护】NPC处于状态覆盖中（exhausted/sick/mental）不接受任务
+        if (this._stateOverride) {
+            this._logDebug('schedule', `[P1] 拒绝任务 ${taskId}：NPC处于状态覆盖(${this._stateOverride})`);
+            console.log(`[P1拒绝] ${this.name} 处于状态覆盖(${this._stateOverride})，拒绝任务 ${taskId}`);
             return false;
         }
 
@@ -2129,6 +2790,12 @@ this.affinity = { qing_xuan: 72 };
         this._taskOverride.isActive = true;
         this._taskOverride.priority = priority || 'normal';
         this._taskOverride.resourceType = resourceType || null;
+        // 【覆盖快照】设置任务覆盖
+        const oldOverrideT = this._activeOverride;
+        this._activeOverride = 'task';
+        if (oldOverrideT !== 'task') {
+            this._logDebug('override', `[覆盖切换] ${oldOverrideT} → task（原因: 任务${taskId}）`);
+        }
         this._taskOverrideReached = false;
         this._taskOverrideStuckTimer = 0;
         this._taskOverrideTravelTimer = 0;
@@ -2265,6 +2932,8 @@ this.affinity = { qing_xuan: 72 };
 
     /** 哲学家/思考型角色主动发起对话 */
     _tryProactiveChat(game, nearby) {
+        // 【全局聊天开关】开关关闭时不主动发起聊天
+        if (!CHAT_ENABLED) return;
         if (this.state === 'CHATTING') return;
         if (!game.dialogueManager) return;
 
@@ -2299,12 +2968,12 @@ this.affinity = { qing_xuan: 72 };
             { key: 'furnace_plaza', x: 25, y: 20, label: '暖炉广场' },
             { key: 'lumber_yard',   x: 8,  y: 8,  label: '伐木场' },
             { key: 'ruins',         x: 42, y: 8,  label: '废墟' },
-            { key: 'warehouse_door', x: 18, y: 24, label: '仓库', enter: 'warehouse' },
-            { key: 'medical_door',   x: 32, y: 24, label: '医疗站', enter: 'medical' },
-            { key: 'dorm_a_door',    x: 14, y: 30, label: '宿舍A', enter: 'dorm_a' },
-            { key: 'dorm_b_door',    x: 36, y: 30, label: '宿舍B', enter: 'dorm_b' },
-            { key: 'kitchen_door',   x: 22, y: 34, label: '炊事房', enter: 'kitchen' },
-            { key: 'workshop_door',  x: 30, y: 34, label: '工坊', enter: 'workshop' },
+            { key: 'warehouse_door', x: 16, y: 16, label: '仓库', enter: 'warehouse' },
+            { key: 'medical_door',   x: 33, y: 16, label: '医疗站', enter: 'medical' },
+            { key: 'dorm_a_door',    x: 16, y: 24, label: '宿舍A', enter: 'dorm_a' },
+            { key: 'dorm_b_door',    x: 33, y: 24, label: '宿舍B', enter: 'dorm_b' },
+            { key: 'kitchen_door',   x: 15, y: 31, label: '炊事房', enter: 'kitchen' },
+            { key: 'workshop_door',  x: 24, y: 31, label: '工坊', enter: 'workshop' },
         ];
         const pos = this.getGridPos();
         // 过滤掉当前已在附近（5格内）的地标，选一个远一点的
@@ -2338,6 +3007,19 @@ this.affinity = { qing_xuan: 72 };
     }
 
     _navigateToScheduleTarget(targetKey, game) {
+        // 【进屋保护期】NPC刚进入室内时，短暂冻结跨场景导航，防止闪现
+        if (this._indoorEntryProtection > 0 && this.currentScene !== 'village') {
+            const loc = SCHEDULE_LOCATIONS[targetKey];
+            if (loc && loc.scene !== this.currentScene) {
+                console.log(`[进屋保护] ${this.name} 进屋保护期剩余${this._indoorEntryProtection.toFixed(1)}s，阻止跨场景导航到 ${targetKey}`);
+                return;
+            }
+        }
+        // 【出门过程保护】NPC正在走向门口准备出门时，不接受新的导航指令
+        if (this._walkingToDoor) {
+            console.log(`[出门保护] ${this.name} 正在出门中，阻止新导航到 ${targetKey}`);
+            return;
+        }
         // 【关键修复】对话中不执行任何导航，防止NPC被传送到其他场景导致对话中断
         // 但urgent任务覆盖可以打断聊天
         if (this.state === 'CHATTING') {
@@ -2443,22 +3125,18 @@ this.affinity = { qing_xuan: 72 };
     }
 
     _getDoorPos() {
-        // 根据当前场景返回对应的门口位置（加随机偏移避免多NPC同时出门堆叠）
-        // 【修复】坐标必须与 maps.js 中建筑的 doorX/doorY 一致
-        const doorMap = {
-            warehouse: { x: 18, y: 25 },
-            medical:   { x: 32, y: 25 },
-            dorm_a:    { x: 14, y: 31 },
-            dorm_b:    { x: 36, y: 31 },
-            kitchen:   { x: 22, y: 35 },
-            workshop:  { x: 30, y: 35 },
-        };
-        const base = doorMap[this.currentScene] || { x: 40, y: 27 };
-        // 出门时在门口附近散开（向南偏移1~3格，左右偏移±1格）
-        return {
-            x: base.x + Math.floor(Math.random() * 3) - 1,
-            y: base.y + 1 + Math.floor(Math.random() * 2)
-        };
+        // 【修复】直接使用SCHEDULE_LOCATIONS中的_door坐标（即建筑门口外一格），确保NPC出门后出现在正确的门口位置
+        const doorKey = this.currentScene + '_door';
+        const doorLoc = SCHEDULE_LOCATIONS[doorKey];
+        if (doorLoc) {
+            // 出门时在门口附近小幅散开（左右偏移±1格，向南偏移0~1格），避免多NPC堆叠
+            return {
+                x: doorLoc.x + Math.floor(Math.random() * 3) - 1,
+                y: doorLoc.y + Math.floor(Math.random() * 2)
+            };
+        }
+        // 兜底：如果找不到门口坐标，返回村庄中心
+        return { x: 25, y: 22 };
     }
 
     /**
@@ -2732,6 +3410,11 @@ this.affinity = { qing_xuan: 72 };
         this.isMoving = false;
         this._pendingEnterScene = null;
         this._pendingEnterKey = null;
+
+        // 【进屋保护期】进入室内场景时设置保护计时器，防止被立即传送回村庄
+        if (scene !== 'village') {
+            this._indoorEntryProtection = 3; // 3秒保护期
+        }
     }
 
     _pathTo(gx, gy, game) {
@@ -3144,6 +3827,7 @@ this.affinity = { qing_xuan: 72 };
 
     // ---- AI 思考 ----
     async think(game) {
+        if (this.isDead) return; // 💀 死亡NPC不思考
         if (this.aiCooldown > 0) return;
         if (this.state === 'CHATTING') return;
         if (this.isSleeping) return; // 睡觉时不思考
@@ -3294,6 +3978,10 @@ ${game.weatherSystem ? `\n【生存状况】\n${game.weatherSystem.getSurvivalSu
 ${game.weatherSystem && game.weatherSystem.getBlizzardUrgencyForPrompt ? `\n${game.weatherSystem.getBlizzardUrgencyForPrompt()}` : ''}
 ${game.resourceSystem ? `资源状况: ${game.resourceSystem.getResourceStatusForPrompt()}` : ''}
 ${game.resourceSystem && game.resourceSystem.getUrgencyPrompt ? game.resourceSystem.getUrgencyPrompt() : ''}
+${game.resourceSystem && game.resourceSystem.getResourceForecastForPrompt ? game.resourceSystem.getResourceForecastForPrompt() : ''}
+${game.resourceSystem && game.resourceSystem.getSupplyRecommendationPrompt ? game.resourceSystem.getSupplyRecommendationPrompt() : ''}
+${game.weatherSystem && (game.weatherSystem.currentDay === 1 || game.weatherSystem.currentDay === 3) ? '\n⏰ 现在是补给窗口期，建议全力采集物资！' : ''}
+${game.resourceSystem ? `资源紧张度: ${game.resourceSystem.getResourceTension().toFixed(2)}/1.0${game.resourceSystem.getResourceTension() >= 0.3 ? '（紧张！减少社交，优先工作）' : game.resourceSystem.getResourceTension() >= 0.1 ? '（偏紧，注意资源）' : '（正常）'}` : ''}
 ${game.furnaceSystem ? `暖炉状况: ${game.furnaceSystem.getFurnaceSummary()}` : ''}
 ${game.taskSystem ? `任务进度: ${game.taskSystem.getTaskSummaryForPrompt()}` : ''}
 ${game.taskSystem ? `你的任务: ${game.taskSystem.getNpcTaskDescForPrompt(this.id)}` : ''}
@@ -3339,6 +4027,10 @@ ${this._currentAction ? `【当前行动】${this._currentAction.reason || this.
 ${this._pendingAction ? `【待执行行动】${this._pendingAction.reason || this._pendingAction.type}` : ''}
 ${this._isCompanion && this._companionLeader ? `【同伴模式】正在跟随${game.npcs.find(n => n.id === this._companionLeader)?.name || '某人'}一起行动` : ''}
 ${this._lastActionThought ? `【最近行动决策】${this._lastActionThought}` : ''}
+${this._hungerOverride ? '🍽️ 【重要】我正在去吃饭的路上或正在吃饭！不要改变目标！' : ''}
+${this._taskOverride && this._taskOverride.isActive ? `📋 【重要】我正在执行任务：${this._taskOverride.taskId}，前往${this._taskOverride.targetLocation}` : ''}
+${this._stateOverride ? `🚨 我正在紧急处理：${this._stateOverride}，不要干预` : ''}
+${this._priorityOverride ? `⚠️ 当前P0紧急状态：${this._priorityOverride}` : ''}
 请根据上面的实际情境，决定你现在的状态。
 注意：
 - mood（心情）必须与当前真实环境匹配（周围没人时不该因社交而高兴）
@@ -3431,6 +4123,27 @@ ${this._lastActionThought ? `【最近行动决策】${this._lastActionThought}`
             // 社交意愿——代码层二次校验：必须附近真的有这个人
             // 【增强】深夜/状态极差/下雨户外时强制清除社交意愿
             const _origWantChat = parsed.wantChat; // debug日志用
+
+            // 【硬保护B5】覆盖状态激活时，强制忽略wantChat，防止聊天走路干扰饥饿/休息/紧急导航
+            if (parsed.wantChat) {
+                let overrideType = null;
+                if (this._hungerOverride) overrideType = '饥饿覆盖';
+                else if (this._stateOverride) overrideType = `状态覆盖(${this._stateOverride})`;
+                else if (this._priorityOverride) overrideType = 'P0紧急';
+                else if (this._taskOverride && this._taskOverride.isActive) overrideType = '任务覆盖';
+                else if (this._walkingToDoor) overrideType = '出门过程';
+                else if (this._currentBehaviorLock) overrideType = `行为锁(${this._currentBehaviorLock.type})`;
+                if (overrideType) {
+                    console.log(`[wantChat保护] ${this.name} 处于${overrideType}中，忽略聊天意愿(${parsed.wantChat})`);
+                    this._logDebug('chat', `[wantChat保护] 处于${overrideType}中，忽略聊天意愿(${parsed.wantChat})`);
+                    parsed.wantChat = '';
+                }
+            }
+
+            if (!CHAT_ENABLED) {
+                parsed.wantChat = '';
+            }
+
             const thinkHour = game.getHour();
             const isLateNight = this._isBedtime(thinkHour);
             if (isLateNight) parsed.wantChat = ''; // 过了就寝时间不社交
@@ -3469,7 +4182,7 @@ ${this._lastActionThought ? `【最近行动决策】${this._lastActionThought}`
             }
 
             // 【挚友关心机制】自己精神还行时，主动找同场景San值低的好友/挚友关心
-            if (!parsed.wantChat && this.sanity >= 40 && !isLateNight && this.state !== 'CHATTING') {
+            if (CHAT_ENABLED && !parsed.wantChat && this.sanity >= 40 && !isLateNight && this.state !== 'CHATTING') {
                 const sameSceneAll = game.npcs.filter(n =>
                     n.id !== this.id && n.currentScene === this.currentScene && !n.isSleeping
                     && n.state !== 'CHATTING' && (n.sanity < 30 || n.isCrazy)
@@ -3625,6 +4338,16 @@ ${this._lastActionThought ? `【最近行动决策】${this._lastActionThought}`
         }
 
         if (!matchedEffect) {
+            // 空转检测：输出警告日志
+            this._logDebug?.(`[⚠️ 空转] ${this.name} 的行为 "${currentDesc}" 未匹配到任何效果`);
+            // 累计空转计时
+            this._idleEffectTimer = (this._idleEffectTimer || 0) + dt * (game.timeSpeed || 60);
+            // 超过1游戏小时自动回退到角色默认生产行为
+            if (this._idleEffectTimer > 3600) {
+                this._logDebug?.(`[⚠️ 空转回退] ${this.name} 空转超过1小时，自动切换到默认生产行为`);
+                this._idleEffectTimer = 0;
+                this._fallbackToRoleDefaultAction(game);
+            }
             this._currentActionEffect = null;
             return;
         }
@@ -3634,6 +4357,9 @@ ${this._lastActionThought ? `【最近行动决策】${this._lastActionThought}`
             this._currentActionEffect = null;
             return;
         }
+
+        // 匹配成功，重置空转计时
+        this._idleEffectTimer = 0;
 
         // 记录当前效果（用于UI显示）
         this._currentActionEffect = matchedEffect;
@@ -3646,10 +4372,14 @@ ${this._lastActionThought ? `【最近行动决策】${this._lastActionThought}`
         const rs = game.resourceSystem;
         switch (matchedEffect.effectType) {
             case 'produce_resource': {
-                // 产出资源（每秒 = ratePerHour / 3600）
+                // 产出资源（每游戏小时 = ratePerHour）
+                // 【修复】dt 是 gameDt（真实秒），需乘以 timeSpeed 转为游戏秒，与消耗侧保持一致
                 if (rs && matchedEffect.resourceType) {
-                    const rate = matchedEffect.ratePerHour / 3600 * staminaEfficiency * specialtyMultiplier;
-                    const produced = rate * dt;
+                    const gameSeconds = dt * (game.timeSpeed || 60);
+                    // 【新增】电力效率加成：工坊/医疗站受电力状态影响
+                    const powerBonus = rs.getPowerEfficiencyBonus ? rs.getPowerEfficiencyBonus(this.currentScene) : 1.0;
+                    const rate = matchedEffect.ratePerHour / 3600 * staminaEfficiency * specialtyMultiplier * powerBonus;
+                    const produced = rate * gameSeconds;
                     rs[matchedEffect.resourceType] = (rs[matchedEffect.resourceType] || 0) + produced;
                     // 【任务10】更新目标追踪计数器
                     if (this._goalTrackers) {
@@ -3657,6 +4387,32 @@ ${this._lastActionThought ? `【最近行动决策】${this._lastActionThought}`
                             this._goalTrackers.woodChopped = (this._goalTrackers.woodChopped || 0) + produced;
                         }
                         this._goalTrackers.gatherCount = (this._goalTrackers.gatherCount || 0) + produced;
+                    }
+
+                    // 【任务8】工作产出累计统计与定期日志
+                    if (!this._productionStats) this._productionStats = {};
+                    const resType = matchedEffect.resourceType;
+                    if (!this._productionStats[resType]) {
+                        this._productionStats[resType] = { total: 0, sessionTotal: 0, lastLogTime: 0 };
+                    }
+                    this._productionStats[resType].total += produced;
+                    this._productionStats[resType].sessionTotal += produced;
+                    // 每游戏小时（3600游戏秒）输出一次产出日志
+                    const gameTime = game.gameTimeSeconds || 0;
+                    if (gameTime - this._productionStats[resType].lastLogTime >= 3600) {
+                        this._productionStats[resType].lastLogTime = gameTime;
+                        const hourlyTotal = this._productionStats[resType].sessionTotal;
+                        if (hourlyTotal > 0.01) {
+                            this._logDebug && this._logDebug('production',
+                                `[产出统计] ${this.name} 本小时产出 ${resType}: +${hourlyTotal.toFixed(2)}` +
+                                ` (效率: 体力${(staminaEfficiency*100).toFixed(0)}% 专长x${specialtyMultiplier} 电力x${powerBonus.toFixed(1)})` +
+                                ` 累计: ${this._productionStats[resType].total.toFixed(2)}`
+                            );
+                            if (game.addEvent) {
+                                game.addEvent(`📦 ${this.name}产出${resType} +${hourlyTotal.toFixed(1)}（累计${this._productionStats[resType].total.toFixed(1)}）`);
+                            }
+                        }
+                        this._productionStats[resType].sessionTotal = 0;
                     }
                 }
                 break;
@@ -3684,9 +4440,19 @@ ${this._lastActionThought ? `【最近行动决策】${this._lastActionThought}`
             }
             case 'craft_medkit': {
                 // 制作急救包（由任务5实现具体逻辑，这里标记状态）
+                // 【修复】dt 需转为游戏秒
                 if (!game._medkitCraftProgress) game._medkitCraftProgress = 0;
-                const craftRate = staminaEfficiency * specialtyMultiplier;
-                game._medkitCraftProgress += (dt / 7200) * craftRate; // 7200秒(2游戏小时)产出1份
+                const craftGameSeconds = dt * (game.timeSpeed || 60);
+                const craftPowerBonus = rs ? (rs.getPowerEfficiencyBonus ? rs.getPowerEfficiencyBonus(this.currentScene) : 1.0) : 1.0;
+                const craftRate = staminaEfficiency * specialtyMultiplier * craftPowerBonus;
+                game._medkitCraftProgress += (craftGameSeconds / 7200) * craftRate; // 7200游戏秒(2游戏小时)产出1份
+                // 【任务8】制作进度日志（每25%通知一次）
+                const medkitPct = Math.floor(game._medkitCraftProgress * 100);
+                if (!this._lastMedkitPctLog) this._lastMedkitPctLog = 0;
+                if (medkitPct >= this._lastMedkitPctLog + 25 && medkitPct < 100) {
+                    this._lastMedkitPctLog = Math.floor(medkitPct / 25) * 25;
+                    this._logDebug && this._logDebug('production', `[进度] ${this.name}制作急救包 ${this._lastMedkitPctLog}%`);
+                }
                 if (game._medkitCraftProgress >= 1) {
                     game._medkitCraftProgress -= 1;
                     game._medkitCount = (game._medkitCount || 0) + 1;
@@ -3705,8 +4471,19 @@ ${this._lastActionThought ? `【最近行动决策】${this._lastActionThought}`
                 // 修理无线电（由任务5实现具体逻辑，这里标记状态）
                 if (game._radioRepaired) break; // 已修好
                 if (!game._radioRepairProgress) game._radioRepairProgress = 0;
+                const repairGameSeconds = dt * (game.timeSpeed || 60);
                 const repairRate = staminaEfficiency * specialtyMultiplier;
-                game._radioRepairProgress += (dt / 28800) * repairRate; // 28800秒(8游戏小时)完成
+                game._radioRepairProgress += (repairGameSeconds / 28800) * repairRate; // 28800游戏秒(8游戏小时)完成
+                // 【任务8】修理进度日志（每25%通知一次）
+                const repairPct = Math.floor(game._radioRepairProgress * 100);
+                if (!this._lastRepairPctLog) this._lastRepairPctLog = 0;
+                if (repairPct >= this._lastRepairPctLog + 25 && repairPct < 100) {
+                    this._lastRepairPctLog = Math.floor(repairPct / 25) * 25;
+                    this._logDebug && this._logDebug('production', `[进度] ${this.name}修理无线电 ${this._lastRepairPctLog}%`);
+                    if (game.addEvent) {
+                        game.addEvent(`🔧 ${this.name}修理无线电进度: ${this._lastRepairPctLog}%`);
+                    }
+                }
                 if (game._radioRepairProgress >= 1) {
                     game._radioRepairProgress = 1;
                     game._radioRepaired = true;
@@ -3721,58 +4498,282 @@ ${this._lastActionThought ? `【最近行动决策】${this._lastActionThought}`
                 // 设置食物浪费减少标记（在用餐系统中使用）
                 game._foodWasteReduction = true;
                 game._foodWasteReductionTimer = 3600; // 标记持续1游戏小时
+                // 【新增】设置木柴浪费减少标记（在资源消耗系统中使用，减少10%木柴消耗）
+                game._woodWasteReduction = true;
+                game._woodWasteReductionTimer = 3600; // 标记持续1游戏小时
+                // 【优化】减少浪费等同于食物产出（+3食物/游戏小时）
+                if (rs) {
+                    const wasteGameSeconds = dt * (game.timeSpeed || 60);
+                    const wasteRate = (3 / 3600) * wasteGameSeconds * specialtyMultiplier;
+                    rs.food = (rs.food || 0) + Math.min(wasteRate, 0.05);
+                }
                 break;
             }
             case 'medical_heal': {
                 // 医疗效果：场景内NPC额外健康恢复
+                // 【修复】dt 需转为游戏秒
+                const healGameSeconds = dt * (game.timeSpeed || 60);
+                const healPowerBonus = rs ? (rs.getPowerEfficiencyBonus ? rs.getPowerEfficiencyBonus(this.currentScene) : 1.0) : 1.0;
                 const npcsInScene = game.npcs.filter(n =>
                     !n.isDead && n.id !== this.id && n.currentScene === this.currentScene
                 );
                 for (const npc of npcsInScene) {
                     if (npc.health < 100) {
-                        npc.health = Math.min(100, npc.health + 0.01 * dt * specialtyMultiplier);
+                        npc.health = Math.min(100, npc.health + 0.01 * healGameSeconds * specialtyMultiplier * healPowerBonus);
+                    }
+                    // 【新增】同场景NPC San值恢复（心理疏导，苏岩therapy专长×1.5）
+                    if (npc.sanity < 100) {
+                        npc.sanity = Math.min(100, npc.sanity + 0.005 * healGameSeconds * specialtyMultiplier);
                     }
                 }
-                // 自动使用急救包（健康<40的NPC）
+                // 【新增】全局健康恢复光环：对不在同场景的存活NPC提供+0.005/游戏秒的恢复
+                const globalHealNpcs = game.npcs.filter(n =>
+                    !n.isDead && n.id !== this.id && n.currentScene !== this.currentScene
+                );
+                for (const npc of globalHealNpcs) {
+                    if (npc.health < 100) {
+                        npc.health = Math.min(100, npc.health + 0.005 * healGameSeconds);
+                    }
+                }
+                // 【增强路径】苏岩坐诊时急救包效果翻倍（+50HP），触发条件放宽到健康<50
                 if (game._medkitCount > 0) {
-                    const critical = npcsInScene.filter(n => n.health < 40).sort((a, b) => a.health - b.health);
+                    const critical = npcsInScene.filter(n => n.health < 50).sort((a, b) => a.health - b.health);
                     if (critical.length > 0 && !this._medkitUseCooldown) {
                         const target = critical[0];
                         game._medkitCount--;
-                        target.health = Math.min(100, target.health + 20);
+                        // 苏岩（medical_treatment专长）恢复翻倍为+50，其他为+25
+                        const isMedicalExpert = !!(this.config.specialties && this.config.specialties.medical_treatment);
+                        const healAmount = isMedicalExpert ? 50 : 25;
+                        target.health = Math.min(100, target.health + healAmount);
                         this._medkitUseCooldown = 30; // 30秒冷却
                         if (game.addEvent) {
-                            game.addEvent(`🩹 ${this.name}使用急救包治疗了${target.name}（健康+20→${Math.round(target.health)}）`);
+                            game.addEvent(`🩹 ${this.name}使用急救包治疗了${target.name}（健康+${healAmount}→${Math.round(target.health)}）${isMedicalExpert ? '（专业加成）' : ''}`);
                         }
-                        this._logDebug('action', `[效果] 使用急救包治疗${target.name}`);
+                        this._logDebug('action', `[效果] 苏岩增强路径：使用急救包治疗${target.name}，恢复+${healAmount}`);
                     }
                 }
-                if (this._medkitUseCooldown > 0) this._medkitUseCooldown -= dt;
+                if (this._medkitUseCooldown > 0) this._medkitUseCooldown -= dt * (game.timeSpeed || 60);
                 break;
             }
             case 'furnace_maintain': {
                 // 暖炉维护——确保暖炉有木柴就运转
                 // 效果：暖炉附近取暖效率+5%（通过标记）
                 game._furnaceMaintained = true;
+                // 【优化】良好维护减少燃料浪费，暖炉消耗-10%
+                game._furnaceFuelSaving = true;
                 break;
             }
             case 'patrol_bonus': {
                 // 巡逻/警戒——全队San恢复加成+10%
                 game._patrolBonus = true;
                 game._patrolBonusTimer = 3600;
+                // 【优化】巡逻为同场景NPC提供San恢复加成（+0.005/游戏秒）
+                // 【修复】排除自身，巡逻效果只给同场景其他NPC加San
+                const patrolGameSeconds = dt * (game.timeSpeed || 60);
+                const patrolNpcs = game.npcs.filter(n =>
+                    !n.isDead && n.id !== this.id && n.currentScene === this.currentScene
+                );
+                for (const npc of patrolNpcs) {
+                    if (npc.sanity < 100) {
+                        npc.sanity = Math.min(100, npc.sanity + 0.005 * patrolGameSeconds * specialtyMultiplier);
+                    }
+                }
                 break;
             }
             case 'morale_boost': {
                 // 安抚鼓舞——当前场景内NPC San值恢复
-                const npcsInScene = game.npcs.filter(n =>
+                // 【增强】基础速率从0.005提升至0.10，老钱专长×2.0后=0.20/秒，接近凌玥演出水平
+                // 【修复】dt 需转为游戏秒
+                const moraleGameSeconds = dt * (game.timeSpeed || 60);
+
+                // 【新增】体力下限保护：体力<15时停止安抚效果
+                if (this.stamina < 15) {
+                    if (!this._moraleBoostTiredNotified) {
+                        this._moraleBoostTiredNotified = true;
+                        this.expression = '太累了…安抚不动了';
+                        this.expressionTimer = 3;
+                    }
+                    break;
+                }
+                this._moraleBoostTiredNotified = false;
+
+                // 【新增】安抚消耗体力：约-5/游戏小时（0.002 * 游戏秒）
+                this.stamina = Math.max(0, this.stamina - 0.002 * moraleGameSeconds);
+
+                const npcsInScene2 = game.npcs.filter(n =>
                     !n.isDead && n.id !== this.id && n.currentScene === this.currentScene
                 );
-                for (const npc of npcsInScene) {
+                for (const npc of npcsInScene2) {
                     if (npc.sanity < 100) {
-                        npc.sanity = Math.min(100, npc.sanity + 0.005 * dt * specialtyMultiplier);
+                        npc.sanity = Math.min(100, npc.sanity + 0.003 * moraleGameSeconds * specialtyMultiplier);
                     }
                 }
                 break;
+            }
+        }
+
+        // 【新增】动态气泡文本：为所有效果类型添加实时数值信息（含体力效率、专长倍率）
+        let dynamicBubble = matchedEffect.bubbleText || '';
+        switch (matchedEffect.effectType) {
+            case 'produce_resource': {
+                // 动态计算实际产出速率（ratePerHour × 体力效率 × 专长倍率 × 电力加成）
+                const bubblePowerBonus = rs && rs.getPowerEfficiencyBonus ? rs.getPowerEfficiencyBonus(this.currentScene) : 1.0;
+                const actualRate = (matchedEffect.ratePerHour || 0) * staminaEfficiency * specialtyMultiplier * bubblePowerBonus;
+                const rateDisplay = actualRate.toFixed(1);
+                if (matchedEffect.resourceType === 'woodFuel') {
+                    dynamicBubble = `🪓 砍柴中（木柴+${rateDisplay}/h）`;
+                } else if (matchedEffect.resourceType === 'food') {
+                    dynamicBubble = `🎣 采集食物中（食物+${rateDisplay}/h）`;
+                } else if (matchedEffect.resourceType === 'material') {
+                    dynamicBubble = `🧱 采集建材中（建材+${rateDisplay}/h）`;
+                } else if (matchedEffect.resourceType === 'power') {
+                    // 区分维修发电机和修理工具
+                    const isRepairTool = (this.stateDesc || '').includes('修理工具');
+                    dynamicBubble = isRepairTool
+                        ? `🔧 修理工具（⚡+${rateDisplay}/h）`
+                        : `🔧 维修发电机中（⚡+${rateDisplay}/h）`;
+                }
+                break;
+            }
+            case 'craft_medkit': {
+                // 计算制作进度百分比和库存数量
+                const medkitProgress = Math.min(100, Math.floor((game._medkitCraftProgress || 0) * 100));
+                const medkitStock = game._medkitCount || 0;
+                dynamicBubble = `💊 制药中（进度${medkitProgress}% 库存×${medkitStock}）`;
+                break;
+            }
+            case 'repair_radio': {
+                // 计算修理进度百分比
+                const radioProgress = Math.min(100, Math.floor((game._radioRepairProgress || 0) * 100));
+                dynamicBubble = game._radioRepaired
+                    ? `📻 无线电已修好！`
+                    : `📻 修理无线电（进度${radioProgress}%）`;
+                break;
+            }
+            case 'build_progress': {
+                // 读取暖炉建造进度
+                const fs = game.furnaceSystem;
+                if (fs && fs.isBuildingSecondFurnace && !fs.secondFurnaceBuilt) {
+                    const buildPct = Math.min(100, Math.floor((fs.buildProgress || 0) * 100));
+                    dynamicBubble = `🔨 暖炉扩建中（进度${buildPct}%）`;
+                } else if (fs && fs.secondFurnaceBuilt) {
+                    dynamicBubble = `🔨 暖炉已建成！`;
+                } else {
+                    dynamicBubble = `🔨 暖炉扩建设计中`;
+                }
+                break;
+            }
+            case 'reduce_waste': {
+                // 动态计算食物产出（3/h × 专长倍率）
+                const wasteFood = (3 * specialtyMultiplier).toFixed(1);
+                const wasteFuelPct = Math.round(10 * specialtyMultiplier);
+                dynamicBubble = `📦 管理仓库中（食物+${wasteFood}/h，柴耗-${wasteFuelPct}%）`;
+                break;
+            }
+            case 'medical_heal': {
+                // 动态计算每小时HP恢复量（基础0.01/游戏秒 × 3600 × 专长倍率）
+                const healPerHour = (0.01 * 3600 * specialtyMultiplier).toFixed(0);
+                const medkitInfo = (game._medkitCount || 0) > 0 ? `💊×${game._medkitCount}` : '⚠️无急救包';
+                dynamicBubble = `🏥 医疗救治中（HP+${healPerHour}/h ${medkitInfo}）`;
+                break;
+            }
+            case 'morale_boost': {
+                // 动态计算San恢复速率（修正后0.003/游戏秒 × 3600 × 专长倍率）
+                const sanPerHour = (0.003 * 3600 * specialtyMultiplier).toFixed(1);
+                dynamicBubble = `💬 安抚鼓舞中（San+${sanPerHour}/h）`;
+                break;
+            }
+            case 'patrol_bonus': {
+                // 动态计算San恢复速率（修正后0.005/游戏秒 × 3600 × 专长倍率）
+                const patrolSanPerHour = (0.005 * 3600 * specialtyMultiplier).toFixed(1);
+                // 【修复】检查同场景是否有San未满的NPC
+                const hasLowSanNpc = game.npcs.some(n =>
+                    !n.isDead && n.id !== this.id && n.currentScene === this.currentScene && n.sanity < 100
+                );
+                dynamicBubble = hasLowSanNpc
+                    ? `🛡️ 巡逻警戒中（全队San恢复+10%, 同伴San+${patrolSanPerHour}/h）`
+                    : `🛡️ 巡逻警戒中（全队San恢复+10%）`;
+                break;
+            }
+            case 'furnace_maintain': {
+                // 动态计算燃料节省（基础10% × 专长倍率）
+                const fuelSavePct = Math.round(10 * specialtyMultiplier);
+                dynamicBubble = `🔥 维护暖炉中（柴耗-${fuelSavePct}%）`;
+                break;
+            }
+        }
+        // 仅在NPC当前没有更重要的表情时设置气泡
+        if (!this.expression || this.expressionTimer <= 0) {
+            this.expression = dynamicBubble;
+            this.expressionTimer = 3;
+        }
+
+        // 【优化】NPC离开辅助效果对应场景时，清除全局标记
+        if (matchedEffect.effectType === 'reduce_waste' || matchedEffect.effectType === 'patrol_bonus' || matchedEffect.effectType === 'furnace_maintain') {
+            // 上面的 requiredScene 检查已确保NPC在正确场景时才执行效果
+            // 这里额外处理：检查是否有NPC仍在执行该辅助效果，如果没有则清除标记
+            // （由于每帧都会执行，标记会被在场NPC重新设置，所以无需额外检查）
+        }
+
+    }
+
+    /**
+     * 【新增】独立的全局急救包自动使用检查
+     * 不限于苏岩坐诊，任何NPC的update周期都会触发检查
+     * 条件：有急救包库存 + 有NPC健康<50 + 无冷却
+     */
+    _checkAutoMedkit(dt, game) {
+        const gameSeconds = dt * (game.timeSpeed || 60);
+
+        // 更新当前NPC的急救包使用个人冷却（确保非medical_heal分支的NPC冷却也能递减）
+        if (this._medkitUseCooldown > 0) this._medkitUseCooldown -= gameSeconds;
+
+        // 更新检查冷却计时
+        if (this._medkitCheckCooldown > 0) {
+            this._medkitCheckCooldown -= gameSeconds;
+            return;
+        }
+
+        // 无急救包则跳过
+        if (!game._medkitCount || game._medkitCount <= 0) {
+            return;
+        }
+
+        // 遍历所有存活NPC，找到健康<50且无个人冷却的NPC
+        const criticalNpcs = game.npcs.filter(n =>
+            !n.isDead && n.health < 50 && !(n._medkitUseCooldown > 0)
+        ).sort((a, b) => a.health - b.health);
+
+        if (criticalNpcs.length === 0) return;
+
+        const target = criticalNpcs[0];
+
+        // 消耗急救包
+        game._medkitCount--;
+
+        // 使用者为苏岩（medical_treatment专长）时恢复翻倍
+        const isMedicalExpert = !!(this.config.specialties && this.config.specialties.medical_treatment);
+        const healAmount = isMedicalExpert ? 50 : 25;
+        target.health = Math.min(100, target.health + healAmount);
+
+        // 设置目标NPC的个人冷却（防止连续消耗）
+        target._medkitUseCooldown = 30;
+        // 设置检查者的全局检查冷却
+        this._medkitCheckCooldown = 10;
+
+        // 生成事件日志和气泡文本
+        if (game.addEvent) {
+            game.addEvent(`💊 ${this.name}为${target.name}使用了急救包（健康+${healAmount}→${Math.round(target.health)}，剩余${game._medkitCount}份）`);
+        }
+        this.expression = `💊 给${target.name}用了急救包`;
+        this.expressionTimer = 3;
+        this._logDebug('action', `[急救包] 全局检查：为${target.name}使用急救包，恢复+${healAmount}，剩余${game._medkitCount}`);
+
+        // 急救包耗尽且有重伤NPC时发出警告
+        if (game._medkitCount <= 0) {
+            const severeNpcs = game.npcs.filter(n => !n.isDead && n.health < 30);
+            if (severeNpcs.length > 0 && game.addEvent) {
+                game.addEvent(`⚠️ 急救包不足！需要药剂师制作急救包`);
             }
         }
     }
@@ -3784,28 +4785,77 @@ ${this._lastActionThought ? `【最近行动决策】${this._lastActionThought}`
         const specialties = this.config.specialties || {};
         switch (effect.effectType) {
             case 'produce_resource':
-                if (effect.resourceType === 'woodFuel' && specialties.chop) return specialties.chop;
-                if (effect.resourceType === 'food' && specialties.gather_food) return specialties.gather_food;
-                if (effect.resourceType === 'power' && specialties.repair) return specialties.repair;
-                if (effect.resourceType === 'material' && specialties.build) return specialties.build;
+                if (effect.resourceType === 'woodFuel' && specialties.chopping) return specialties.chopping;
+                if (effect.resourceType === 'food' && specialties.gathering_food) return specialties.gathering_food;
+                if (effect.resourceType === 'power' && specialties.generator_repair) return specialties.generator_repair;
+                if (effect.resourceType === 'material' && specialties.gathering_material) return specialties.gathering_material;
                 break;
             case 'build_progress':
                 if (specialties.furnace_build) return specialties.furnace_build;
-                if (specialties.build) return specialties.build;
+                if (specialties.construction) return specialties.construction;
                 break;
             case 'craft_medkit':
-                if (specialties.medkit) return specialties.medkit;
-                if (specialties.medical) return specialties.medical;
+                if (specialties.herbal_craft) return specialties.herbal_craft;
                 break;
             case 'repair_radio':
-                if (specialties.radio) return specialties.radio;
-                if (specialties.repair) return specialties.repair;
+                // radio_repair 是 boolean(true)，转化为1.5倍率
+                if (specialties.radio_repair) return typeof specialties.radio_repair === 'number' ? specialties.radio_repair : 1.5;
                 break;
             case 'medical_heal':
-                if (specialties.medical) return specialties.medical;
+                if (specialties.medical_treatment) return specialties.medical_treatment;
+                break;
+            case 'morale_boost':
+                if (specialties.morale_boost) return specialties.morale_boost;
+                if (specialties.morale_inspire) return specialties.morale_inspire;
+                break;
+            case 'furnace_maintain':
+                if (specialties.furnace_maintain) return specialties.furnace_maintain;
+                break;
+            case 'reduce_waste':
+                if (specialties.food_processing) return specialties.food_processing;
                 break;
         }
         return 1.0; // 默认无加成
+    }
+
+    /**
+     * 获取角色专长的人类可读描述（供LLM prompt使用）
+     */
+    _getSpecialtyDescription() {
+        const specialties = this.config.specialties || {};
+        const descParts = [];
+        // 资源产出类
+        if (specialties.chopping) descParts.push(`砍柴效率×${specialties.chopping}`);
+        if (specialties.hauling) descParts.push(`搬运效率×${specialties.hauling}`);
+        if (specialties.food_processing) descParts.push(`食物加工效率×${specialties.food_processing}`);
+        if (specialties.gathering_material) descParts.push(`建材采集×${specialties.gathering_material}`);
+        if (specialties.gathering_food) descParts.push(`食物采集×${specialties.gathering_food}`);
+        if (specialties.generator_repair) descParts.push(`发电机维修×${specialties.generator_repair}`);
+        if (specialties.furnace_build) descParts.push(`暖炉扩建×${specialties.furnace_build}`);
+        if (specialties.furnace_maintain) descParts.push(`暖炉维护×${specialties.furnace_maintain}`);
+        if (specialties.construction) descParts.push(`建造×${specialties.construction}`);
+        // 辅助类
+        if (specialties.inventory_waste) descParts.push(`物资管理减少浪费${(specialties.inventory_waste * 100).toFixed(0)}%`);
+        if (specialties.fair_distribution) descParts.push('分配公平（减少冲突）');
+        if (specialties.conflict_resolve) descParts.push(`调解冲突×${specialties.conflict_resolve}`);
+        if (specialties.morale_boost) descParts.push(`安抚效果×${specialties.morale_boost}`);
+        if (specialties.morale_inspire) descParts.push(`鼓舞士气×${specialties.morale_inspire}`);
+        if (specialties.team_planning) descParts.push(`全队规划+${(specialties.team_planning * 100).toFixed(0)}%效率`);
+        // 医疗类
+        if (specialties.medical_treatment) descParts.push(`治疗效果×${specialties.medical_treatment}`);
+        if (specialties.hypothermia_save) descParts.push(`失温救治+${(specialties.hypothermia_save * 100).toFixed(0)}%`);
+        if (specialties.therapy) descParts.push(`心理疏导×${specialties.therapy}`);
+        if (specialties.herbal_craft) descParts.push(`草药制剂×${specialties.herbal_craft}`);
+        // 特殊类
+        if (specialties.scout_ruins) descParts.push(`废墟侦察稀有物资×${specialties.scout_ruins}`);
+        if (specialties.field_aid) descParts.push(`野外急救×${specialties.field_aid}`);
+        if (specialties.cold_resist) descParts.push(`耐寒（体温下降×${specialties.cold_resist}）`);
+        if (specialties.trap_alarm) descParts.push('可制作陷阱/警报');
+        if (specialties.radio_repair) descParts.push('可修理无线电');
+        if (specialties.climb_explore) descParts.push('可进入危险区域');
+        if (specialties.crisis_predict) descParts.push('经验预警');
+        if (specialties.learn_others) descParts.push(`学习效率×${specialties.learn_others}`);
+        return descParts.length > 0 ? descParts.join('，') : '无特殊专长';
     }
 
     /** 每帧更新属性（缓慢变化模式）
@@ -5044,7 +6094,22 @@ ${this._lastActionThought ? `【最近行动决策】${this._lastActionThought}`
         const rs = game.resourceSystem;
         const noFoodCrisis = rs && rs.crisisFlags.noFood;
         const hungerMultiplier = noFoodCrisis ? 2.0 : 1.0;
-        const decayRate = (this.isSleeping ? 0 : 0.4) * hungerMultiplier; // 睡觉时不掉饱食度
+
+        // 【极寒天气强化】户外寒冷饥饿乘数——越冷越饿
+        let coldHungerMult = 1.0;
+        const isOutdoor = this.currentScene === 'village';
+        if (isOutdoor && game.weatherSystem) {
+            const temp = game.weatherSystem.getEffectiveTemp();
+            if (temp < -50) {
+                coldHungerMult = 3.0;
+            } else if (temp < -20) {
+                coldHungerMult = 2.5;
+            } else if (temp < 0) {
+                coldHungerMult = 1 + Math.abs(temp) / 40; // -10°C→×1.25, -20°C→×1.5
+            }
+        }
+
+        const decayRate = (this.isSleeping ? 0 : 0.4) * hungerMultiplier * coldHungerMult; // 睡觉时不掉饱食度
         this.hunger = Math.max(0, this.hunger - decayRate * dt);
 
         // 正在吃饭中
@@ -5055,7 +6120,10 @@ ${this._lastActionThought ? `【最近行动决策】${this._lastActionThought}`
                 
                 // 【关键修复】吃饭时实际消耗食物存储！
                 const rs2 = game.resourceSystem;
-                const foodPerMeal = 1.5; // 每人每餐消耗1.5单位食物（与RESOURCE_CONSUMPTION.foodPerMealPerPerson一致）
+                // 应用天气食物消耗乘数：寒冷天气下每餐消耗更多食物
+                const baseFoodPerMeal = 1.5; // 基础每人每餐消耗1.5单位食物
+                const weatherFoodMult = (rs2 && rs2._weatherConsumptionMult) ? (rs2._weatherConsumptionMult.food || 1.0) : 1.0;
+                const foodPerMeal = baseFoodPerMeal * weatherFoodMult;
                 if (rs2) {
                     if (rs2.food >= foodPerMeal) {
                         rs2.consumeResource('food', foodPerMeal, `${this.name}吃饭`);
@@ -5063,7 +6131,8 @@ ${this._lastActionThought ? `【最近行动决策】${this._lastActionThought}`
                         this.mood = '满足';
                         this.expression = '吃饱了，真舒服！';
                         if (game.addEvent) {
-                            game.addEvent(`🍴 ${this.name} 吃饱了（-${foodPerMeal}食物，剩余${Math.round(rs2.food)}，饱食度: ${Math.round(this.hunger)}）`);
+                            const multInfo = weatherFoodMult > 1.0 ? `(寒冷×${weatherFoodMult.toFixed(1)})` : '';
+                            game.addEvent(`🍴 ${this.name} 吃饱了（-${foodPerMeal.toFixed(1)}食物${multInfo}，剩余${Math.round(rs2.food)}，饱食度: ${Math.round(this.hunger)}）`);
                         }
                     } else if (rs2.food > 0) {
                         // 食物不足，按比例恢复
@@ -5094,6 +6163,8 @@ ${this._lastActionThought ? `【最近行动决策】${this._lastActionThought}`
                 this._hungerTarget = null;
                 this._hungerStuckTimer = 0;
                 this._hungerTravelTimer = 0;
+                // 【行为锁】吃饭完成，释放行为锁，检查pending队列
+                this._releaseBehaviorLock('eating');
                 // 重置日程索引，让日程系统在下一帧重新接管
                 this.currentScheduleIdx = -1;
                 this.scheduleReached = false;
@@ -5107,7 +6178,46 @@ ${this._lastActionThought ? `【最近行动决策】${this._lastActionThought}`
         const hour = game.getHour();
         const isLateNight = this._isBedtime(hour);
         const hasHigherPriorityNeed = this.stamina < 15 || (this.isSick && this.health < 25) || this._stateOverride;
-        if (this.hunger < 35 && !this._hungerOverride && !this.isEating && this.state !== 'CHATTING' && !this.isSleeping && !isLateNight && this._hungerTriggerCooldown <= 0 && !hasHigherPriorityNeed) {
+        const hasFoodAvailable = game.resourceSystem && game.resourceSystem.food > 0;
+
+        // 【强制进食保护】饥饿<10 且有食物且正在睡觉：最最高优先级，打断睡眠去吃饭
+        // 【修复】不能饿着肚子睡觉！饱腹=0时必须醒来去吃饭
+        if (this.hunger < 10 && hasFoodAvailable && this.isSleeping && !this._hungerOverride && !this.isEating && this._hungerTriggerCooldown <= 0) {
+            console.warn(`[NPC] ${this.name} 饱腹极低(${Math.round(this.hunger)})且在睡觉，打断睡眠去吃饭！`);
+            if (game.addEvent) {
+                game.addEvent(`🚨 ${this.name} 饿醒了(饱腹${Math.round(this.hunger)})，必须先去吃饭！`);
+            }
+            // 打断睡眠
+            this.isSleeping = false;
+            this.state = 'IDLE';
+            this._forcedSleep = false;
+            this._hungerTriggerCooldown = 5;
+            this._triggerHungerBehavior(game);
+            return; // 提前返回，不再检查后续条件
+        }
+        // 【强制进食保护】饥饿<15 且有食物：最高优先级，中断当前一切非紧急任务立即进食
+        if (this.hunger < 15 && hasFoodAvailable && !this._hungerOverride && !this.isEating && !this.isSleeping && this._hungerTriggerCooldown <= 0) {
+            // 中断当前任务，强制进食
+            this._actionOverride = false;
+            this._currentAction = null;
+            this._pendingAction = null;
+            if (this.state === 'CHATTING') {
+                this.state = 'IDLE';
+            }
+            this._hungerTriggerCooldown = 5; // 紧急情况缩短冷却
+            console.warn(`[NPC] ${this.name} 饥饿值极低(${Math.round(this.hunger)})，强制中断任务去进食！`);
+            if (game.addEvent) {
+                game.addEvent(`🚨 ${this.name} 饿得快撑不住了(${Math.round(this.hunger)})，紧急去找食物！`);
+            }
+            this._triggerHungerBehavior(game);
+        }
+        // 【强制进食保护】饥饿<25 且有食物：放宽限制（忽略深夜、忽略低优先级阻断），确保NPC去吃饭
+        else if (this.hunger < 25 && hasFoodAvailable && !this._hungerOverride && !this.isEating && !this.isSleeping && this._hungerTriggerCooldown <= 0 && !this._stateOverride) {
+            this._hungerTriggerCooldown = 8;
+            this._triggerHungerBehavior(game);
+        }
+        // 常规饥饿触发：hunger<35，保持原有条件
+        else if (this.hunger < 35 && !this._hungerOverride && !this.isEating && this.state !== 'CHATTING' && !this.isSleeping && !isLateNight && this._hungerTriggerCooldown <= 0 && !hasHigherPriorityNeed) {
             this._hungerTriggerCooldown = 10; // 10秒冷却，避免反复触发刷屏
             this._triggerHungerBehavior(game);
         }
@@ -5115,9 +6225,53 @@ ${this._lastActionThought ? `【最近行动决策】${this._lastActionThought}`
 
     /** 饥饿触发：打断当前日程，去吃饭 */
     _triggerHungerBehavior(game) {
+        // 【出门过程保护】NPC正在出门时不触发饥饿行为（致命紧急除外）
+        if (this._walkingToDoor) {
+            if (this.health >= 10 && (this.bodyTemp === undefined || this.bodyTemp >= 33)) {
+                console.log(`[出门保护] ${this.name} 正在出门中，延迟饥饿行为触发`);
+                return;
+            }
+        }
+        // 【P0保护】P0紧急状态中且非极度饥饿时，不触发饥饿覆盖（让P0先完成）
+        if (this._priorityOverride && this.hunger >= 10) {
+            console.log(`[P0保护] ${this.name} 处于P0状态(${this._priorityOverride})，hunger=${Math.round(this.hunger)}>=10，跳过饥饿触发`);
+            return;
+        }
+        // 【覆盖快照】设置饥饿覆盖
+        const oldOverride = this._activeOverride;
+        this._activeOverride = 'hunger';
+        if (oldOverride !== 'hunger') {
+            this._logDebug('override', `[覆盖切换] ${oldOverride} → hunger（原因: 饥饿触发）`);
+        }
         this._hungerOverride = true;
         this._hungerStuckTimer = 0;
         this._logDebug('hunger', `触发饥饿行为 饱食度:${Math.round(this.hunger)}/100`);
+
+        // 【任务4】饥饿触发时暂停/取消任务覆盖
+        if (this._taskOverride && this._taskOverride.isActive) {
+            if (this.hunger < 15) {
+                // 极度饥饿：彻底取消任务
+                console.log(`[饥饿优先] ${this.name} 极度饥饿(${Math.round(this.hunger)})，取消任务 ${this._taskOverride.taskId}`);
+                this.deactivateTaskOverride();
+            } else {
+                // 一般饥饿：暂停任务
+                console.log(`[饥饿优先] ${this.name} 饥饿(${Math.round(this.hunger)})，暂停任务 ${this._taskOverride.taskId} 先去吃饭`);
+                this._taskOverride.isActive = false;
+            }
+        }
+
+        // 【任务4】饥饿触发时暂停/取消任务覆盖
+        if (this._taskOverride && this._taskOverride.isActive) {
+            if (this.hunger < 15) {
+                // 极度饥饿：彻底取消任务
+                console.log(`[饥饿优先] ${this.name} 极度饥饿(${Math.round(this.hunger)})，取消任务 ${this._taskOverride.taskId}`);
+                this.deactivateTaskOverride();
+            } else {
+                // 一般饥饿：暂停任务
+                console.log(`[饥饿优先] ${this.name} 饥饿(${Math.round(this.hunger)})，暂停任务 ${this._taskOverride.taskId} 先去吃饭`);
+                this._taskOverride.isActive = false;
+            }
+        }
 
         // 根据角色和时间选择去哪吃
         const hour = game.getHour();
@@ -5249,6 +6403,8 @@ _checkEatingArrival(dt, game) {
     /** 开始吃饭 */
     _startEating(game) {
         if (!this._hungerTarget) return; // 防御：饥饿目标已被清除
+        // 【行为锁】获取吃饭行为锁（优先级3=基本需求），防止被低优先级系统打断
+        this._acquireBehaviorLock('eating', BEHAVIOR_PRIORITY.BASIC_NEED);
         this.isEating = true;
         this.eatingTimer = 20; // 吃饭持续 20 真实秒 ≈ 20 游戏分钟（dt 已含倍速，倍速下会更快吃完）
         this.stateDesc = `正在${this._hungerTarget.desc}`;
@@ -5262,6 +6418,177 @@ _checkEatingArrival(dt, game) {
         if (game.addEvent) {
             game.addEvent(`🍜 ${this.name} 开始吃饭`);
         }
+    }
+
+    // ============ 资源采集覆盖系统 ============
+    // 参考饥饿覆盖(_hungerOverride)模式：资源紧缺时自动派NPC去采集
+
+    /** 检查是否需要触发资源采集覆盖 */
+    _checkResourceGatherNeed(game) {
+        // 冷却递减（在update中每帧调用，冷却由dt在_updateResourceGatherOverride中处理）
+        // 前置检查：不处于任何覆盖/特殊状态
+        if (this._resourceGatherOverride) return;
+        if (this._hungerOverride || this._stateOverride) return;
+        if (this.isSleeping || this.isEating || this.isCrazy || this.isDead) return;
+        if (this.stamina < 20) return;
+        if (this._resourceGatherCooldown > 0) return;
+        if (this._isDying || this._rescueNeeded) return;
+
+        const rs = game.resourceSystem;
+        if (!rs) return;
+
+        // 人数限制：最多3个NPC同时出门采集
+        const gatheringCount = game.npcs.filter(n => n._resourceGatherOverride && !n.isDead).length;
+        if (gatheringCount >= 3) return;
+
+        const role = this.config.role;
+        const specs = this.config.specialties || {};
+        let gatherType = null;
+        let gatherTarget = null;
+        let stateDescText = null;
+
+        // 木柴检测：剩余<2小时，且NPC是体力型角色
+        if (rs.getWoodFuelHoursRemaining() < 2) {
+            const isPhysical = (role === 'worker' || specs.chopping || specs.hauling || specs.furnace_maintain);
+            if (isPhysical) {
+                gatherType = 'wood';
+                gatherTarget = 'lumber_camp';
+                stateDescText = '砍柴';
+            }
+        }
+
+        // 食物检测：剩余<=1餐，且NPC不是医生/镇长
+        if (!gatherType && rs.getFoodMealsRemaining() <= 1) {
+            const isNotSpecialist = (this.config.id !== 'su_doctor' && this.config.id !== 'old_qian');
+            if (isNotSpecialist) {
+                gatherType = 'food';
+                gatherTarget = 'frozen_lake';
+                stateDescText = '采集食物';
+            }
+        }
+
+        if (!gatherType) return;
+
+        // 触发资源采集覆盖
+        // 【覆盖快照】设置资源采集覆盖
+        const oldOverrideR = this._activeOverride;
+        this._activeOverride = 'resource';
+        if (oldOverrideR !== 'resource') {
+            this._logDebug('override', `[覆盖切换] ${oldOverrideR} → resource（原因: ${gatherType}采集）`);
+        }
+        this._resourceGatherOverride = true;
+        this._resourceGatherTarget = gatherTarget;
+        this._resourceGatherType = gatherType;
+        this._resourceGatherTravelTimer = 0;
+        this.stateDesc = stateDescText;
+        this.mood = '紧迫';
+        this.expression = gatherType === 'wood' ? '木柴不够了，赶紧去砍！' : '食物快没了，赶紧去采！';
+        this.expressionTimer = 5;
+
+        // 清除当前移动路径，重新导航
+        this.currentPath = [];
+        this.isMoving = false;
+        this._pendingEnterScene = null;
+        // 清除LLM行动覆盖，资源采集优先
+        this._actionOverride = false;
+        this._currentAction = null;
+        this._pendingAction = null;
+
+        this._navigateToScheduleTarget(gatherTarget, game);
+        this.scheduleReached = false;
+
+        if (game.addEvent) {
+            const emoji = gatherType === 'wood' ? '🪓' : '🎣';
+            game.addEvent(`${emoji} ${this.name} 资源紧缺，自动前往${gatherTarget === 'lumber_camp' ? '伐木场砍柴' : '冰湖采集食物'}！`);
+        }
+        this._logDebug && this._logDebug('resource_gather', `触发资源采集覆盖 type=${gatherType} target=${gatherTarget}`);
+    }
+
+    /** 更新资源采集覆盖状态（每帧调用） */
+    _updateResourceGatherOverride(dt, game) {
+        // 冷却递减
+        if (this._resourceGatherCooldown > 0) {
+            this._resourceGatherCooldown -= dt;
+        }
+
+        if (!this._resourceGatherOverride) return;
+
+        // 被P0事件打断（饥饿覆盖、状态覆盖、发疯、濒死等）
+        if (this._hungerOverride || this._stateOverride || this.isCrazy || this._isDying || this._rescueNeeded || this.isDead) {
+            this._clearResourceGatherOverride();
+            return;
+        }
+
+        const rs = game.resourceSystem;
+        if (!rs) {
+            this._clearResourceGatherOverride();
+            return;
+        }
+
+        // 退出条件1：资源恢复安全线
+        if (this._resourceGatherType === 'wood' && rs.getWoodFuelHoursRemaining() > 4) {
+            if (game.addEvent) game.addEvent(`✅ ${this.name} 木柴已充足，停止砍柴返回`);
+            this._clearResourceGatherOverride();
+            return;
+        }
+        if (this._resourceGatherType === 'food' && rs.getFoodMealsRemaining() > 2) {
+            if (game.addEvent) game.addEvent(`✅ ${this.name} 食物已充足，停止采集返回`);
+            this._clearResourceGatherOverride();
+            return;
+        }
+
+        // 退出条件2：体力不足
+        if (this.stamina < 20) {
+            if (game.addEvent) game.addEvent(`😓 ${this.name} 体力不足(${Math.round(this.stamina)})，停止采集`);
+            this._clearResourceGatherOverride();
+            return;
+        }
+
+        // 到达检测：在村庄场景中，且距离目标位置<6格
+        if (this.currentScene === 'village') {
+            const targetLoc = SCHEDULE_LOCATIONS[this._resourceGatherTarget];
+            if (targetLoc) {
+                const pos = this.getGridPos();
+                const dist = Math.abs(pos.x - targetLoc.x) + Math.abs(pos.y - targetLoc.y);
+                if (dist <= 6) {
+                    // 已到达采集区，stateDesc已设置为匹配produce_resource的关键词
+                    // _updateActionEffect会自动产出资源
+                    this._resourceGatherTravelTimer = 0; // 到了就不再计时
+                    return;
+                }
+            }
+        }
+
+        // 超时兜底：15秒内未到达 → 传送到目标位置
+        this._resourceGatherTravelTimer += dt;
+        if (this._resourceGatherTravelTimer > 15) {
+            this._resourceGatherTravelTimer = 0;
+            const targetLoc = SCHEDULE_LOCATIONS[this._resourceGatherTarget];
+            if (targetLoc) {
+                this._teleportTo(targetLoc.scene, targetLoc.x, targetLoc.y);
+                if (game.addEvent) {
+                    game.addEvent(`⚡ ${this.name} 赶到了采集区（传送兜底）`);
+                }
+            }
+        }
+    }
+
+    /** 清除资源采集覆盖状态 */
+    _clearResourceGatherOverride() {
+        this._resourceGatherOverride = false;
+        this._resourceGatherTarget = null;
+        this._resourceGatherType = null;
+        this._resourceGatherTravelTimer = 0;
+        this._resourceGatherCooldown = 120; // 120秒冷却，避免反复触发
+        // 【覆盖快照】清除时重置_activeOverride
+        if (this._activeOverride === 'resource') {
+            this._activeOverride = 'none';
+            this._logDebug('override', `[覆盖切换] resource → none（原因: 资源采集覆盖清除）`);
+            this._executePendingBehavior();
+        }
+        // 重置日程索引，让日程系统重新接管
+        this.currentScheduleIdx = -1;
+        this.scheduleReached = false;
     }
 
     // ============ 状态驱动行为覆盖系统 ============
@@ -5296,7 +6623,9 @@ _checkEatingArrival(dt, game) {
 
         // 不在覆盖中 → 检查是否需要触发新的状态覆盖
         if (this._stateOverrideCooldown > 0) return;
-        if (this.state === 'CHATTING' || this.isSleeping || this.isEating) return;
+        if (this.state === 'CHATTING' || this.isEating) return;
+        // 【修复】睡觉中也允许仲裁：但仅限饱腹极低时（饿醒去吃饭）
+        if (this.isSleeping && this.hunger >= 10) return; // 睡觉中且不太饿，不仲裁
         if (this.isCrazy) return; // 发疯中不触发（发疯有自己的逻辑）
 
         const hour = game.getHour();
@@ -5304,15 +6633,35 @@ _checkEatingArrival(dt, game) {
 
         // 【优先级仲裁】体力极低/生病时，强制打断饥饿覆盖
         // 优先级顺序：体力极低 > 生病 > 饥饿 > 精神差
+        // 【修复】如果NPC正在睡觉且饱腹<10，跳过体力仲裁，直接走饥饿路径
         // 优先级1：体力极低 → 回家睡觉（可打断饥饿）
-        if (this.stamina < 15 && !isLateNight) {
+        if (this.stamina < 15 && !isLateNight && !this.isSleeping) {
             if (this._hungerOverride) {
-                // 强制打断饥饿覆盖，因为体力太低了
+                // 【行为锁保护】如果正在吃饭(isEating=true)，检查距离——快到了/正在吃就不打断
+                if (this.isEating) {
+                    this._logDebug('override', `[行为锁] 体力极低(${Math.round(this.stamina)})但正在吃饭，不打断`);
+                    return; // 正在吃饭中，不打断，等吃完
+                }
+                // 【行为锁保护】在前往吃饭途中，检查距离吃饭目标是否≤3格
+                if (this._hungerTarget) {
+                    const loc = SCHEDULE_LOCATIONS[this._hungerTarget.target];
+                    if (loc && loc.scene === this.currentScene) {
+                        const gx = Math.floor((this.x + this.width / 2) / TILE);
+                        const gy = Math.floor((this.y + this.height / 2) / TILE);
+                        const dist = Math.abs(gx - loc.x) + Math.abs(gy - loc.y);
+                        if (dist <= 3) {
+                            this._logDebug('override', `[行为锁] 体力极低但距吃饭目标仅${dist}格，不打断`);
+                            return; // 快到了，让NPC先吃完
+                        }
+                    }
+                }
+                // 距离较远，允许打断
                 this._hungerOverride = false;
                 this._hungerTarget = null;
                 this._hungerStuckTimer = 0;
                 this._hungerTravelTimer = 0;
                 this.isEating = false;
+                this._releaseBehaviorLock('eating'); // 释放可能的吃饭锁
                 console.log(`[优先级仲裁] ${this.name} 体力极低(${Math.round(this.stamina)})，打断饥饿行为优先回家休息`);
             }
             this._triggerStateOverride('exhausted', game);
@@ -5323,11 +6672,17 @@ _checkEatingArrival(dt, game) {
         // 【增强】提高触发阈值：健康<35就触发（原来<25）
         if ((this.isSick || this.health < 35) && !isLateNight) {
             if (this._hungerOverride) {
+                // 【行为锁保护】正在吃饭时，不打断（除非健康<10致命紧急）
+                if (this.isEating && this.health >= 10) {
+                    this._logDebug('override', `[行为锁] 生病但正在吃饭(健康${Math.round(this.health)}>=10)，不打断`);
+                    return;
+                }
                 this._hungerOverride = false;
                 this._hungerTarget = null;
                 this._hungerStuckTimer = 0;
                 this._hungerTravelTimer = 0;
                 this.isEating = false;
+                this._releaseBehaviorLock('eating'); // 释放可能的吃饭锁
                 console.log(`[优先级仲裁] ${this.name} 生病/健康极低，打断饥饿行为优先看病`);
             }
             this._triggerStateOverride('sick', game);
@@ -5347,6 +6702,19 @@ _checkEatingArrival(dt, game) {
 
     /** 触发状态覆盖行为 */
     _triggerStateOverride(type, game) {
+        // 【出门过程保护】NPC正在出门时不触发状态覆盖（致命紧急除外）
+        if (this._walkingToDoor) {
+            if (this.health >= 10 && (this.bodyTemp === undefined || this.bodyTemp >= 33)) {
+                console.log(`[出门保护] ${this.name} 正在出门中，延迟状态覆盖(${type})触发`);
+                return;
+            }
+        }
+        // 【覆盖快照】设置_activeOverride
+        const oldOverride = this._activeOverride;
+        this._activeOverride = 'state';
+        if (oldOverride !== 'state') {
+            this._logDebug('override', `[覆盖切换] ${oldOverride} → state（原因: ${type}）`);
+        }
         this._stateOverride = type;
         this._stateOverrideStuckTimer = 0;
         this._stateOverrideTravelTimer = 0;
@@ -5430,8 +6798,15 @@ _checkEatingArrival(dt, game) {
                         // 到达房间 → 强制入睡
                         this._clearStateOverride();
                         this.isSleeping = true;
+                        this._forcedSleep = true;  // 【标记强制睡眠】防止被日程起床逻辑误唤醒
+                        this._forcedSleepTimer = 0;
                         this.stateDesc = '累坏了，倒头就睡';
                         this._logDebug('sleep', `累坏倒头就睡 体力:${Math.round(this.stamina)} San:${Math.round(this.sanity)}`);
+                        // AI模式日志：累坏入睡
+                        if (this.game && this.game.aiModeLogger) {
+                            const snap = AIModeLogger.npcAttrSnapshot(this);
+                            this.game.aiModeLogger.log('SLEEP_START', `${this.name} 累坏倒头就睡 | ${snap} | ${this.currentScene || '?'}`);
+                        }
                         this.expression = 'Zzz...';
                         this.expressionTimer = 8;
                         this.mood = '疲惫';
@@ -5576,11 +6951,19 @@ _checkEatingArrival(dt, game) {
 
     /** 清除状态覆盖 */
     _clearStateOverride() {
+        const wasType = this._stateOverride;
         this._stateOverride = null;
         this._stateOverrideTarget = null;
         this._stateOverrideStuckTimer = 0;
         this._stateOverrideTravelTimer = 0;
         this._stateOverrideMaxTimer = 0;
+        // 【覆盖快照】清除时重置_activeOverride并检查pending队列
+        if (wasType && this._activeOverride === 'state') {
+            const old = this._activeOverride;
+            this._activeOverride = 'none';
+            this._logDebug('override', `[覆盖切换] ${old} → none（原因: 状态覆盖(${wasType})清除）`);
+            this._executePendingBehavior();
+        }
     }
 
     // ============ 发呆兜底检测系统 ============
@@ -5615,6 +6998,12 @@ _checkEatingArrival(dt, game) {
             return;
         }
 
+        // 连续20秒发呆且无决策冷却时，强制触发一次行动决策（防止长时间空闲）
+        if (this._idleWatchdogTimer > 20 && this._idleWatchdogTimer <= 30 && this._actionDecisionCooldown > 0) {
+            this._actionDecisionCooldown = 0; // 清零冷却，允许立即触发决策
+            this._logDebug('schedule', `[兜底] ${this.name} 空闲超过20秒，强制触发行动决策`);
+        }
+
         // 连续10秒发呆，触发恢复
         if (this._idleWatchdogTimer > 10) {
             // 输出详细状态快照
@@ -5635,17 +7024,8 @@ _checkEatingArrival(dt, game) {
                 pos: this.getGridPos()
             });
 
-            // 清除所有可能残留的覆盖状态
-            this._clearActionOverride();
-            this._clearStateOverride();
-            this._hungerOverride = false;
-            this._hungerTarget = null;
-            this._hungerStuckTimer = 0;
-            this._hungerTravelTimer = 0;
-
-            // 强制日程系统重新评估
-            this.currentScheduleIdx = -1;
-            this.scheduleReached = false;
+            // 清除所有可能残留的覆盖状态（使用统一兜底方法）
+            this._clearAllOverrides();
 
             // 如果有被暂停的任务，优先恢复任务
             if (this._taskOverride && this._taskOverride.targetLocation && this._taskOverride.taskId) {
@@ -5675,14 +7055,22 @@ _checkEatingArrival(dt, game) {
             }
 
             // 同一NPC在60秒内连续触发超过3次，强制传送到暖炉广场
+            // 【修复】行为锁/吃饭/睡觉/治疗/休息缓冲期内不触发强制传送
             if (this._idleWatchdogCount > 3) {
-                const furnaceLoc = SCHEDULE_LOCATIONS['furnace_plaza'];
-                if (furnaceLoc) {
-                    console.warn(`[NPC-${this.name}] [兜底] 60秒内发呆超过3次，强制传送到暖炉广场`);
-                    this._teleportTo(furnaceLoc.scene, furnaceLoc.x, furnaceLoc.y);
+                const isProtected = this.isEating || this.isSleeping || this._isBeingTreated
+                    || this._restCooldownTimer > 0 || this._currentBehaviorLock;
+                if (isProtected) {
+                    console.log(`[NPC-${this.name}] [兜底] 反复发呆但处于保护状态(${this._currentBehaviorLock || 'protected'})，跳过强制传送`);
                     this._idleWatchdogCount = 0;
-                    if (game && game.addEvent) {
-                        game.addEvent(`🚨 ${this.name} 被传送到暖炉广场（反复发呆）`);
+                } else {
+                    const furnaceLoc = SCHEDULE_LOCATIONS['furnace_plaza'];
+                    if (furnaceLoc) {
+                        console.warn(`[NPC-${this.name}] [兜底] 60秒内发呆超过3次，强制传送到暖炉广场`);
+                        this._teleportTo(furnaceLoc.scene, furnaceLoc.x, furnaceLoc.y);
+                        this._idleWatchdogCount = 0;
+                        if (game && game.addEvent) {
+                            game.addEvent(`🚨 ${this.name} 被传送到暖炉广场（反复发呆）`);
+                        }
                     }
                 }
             }
@@ -5694,15 +7082,18 @@ _checkEatingArrival(dt, game) {
     /** 可选目标位置列表（供LLM选择） */
     static get ACTION_TARGETS() {
         return {
-            'warehouse_door':  '仓库（领取物资、整理库存）',
-            'medical_door':    '医疗站（看病、心理咨询、找苏岩）',
+            'warehouse_door':  '仓库（盘点物资→减少浪费，辅助效果，室内）',
+            'medical_door':    '医疗站（治疗→恢复健康，心理疏导→恢复San值，室内）',
             'dorm_a_door':     '宿舍A（休息、睡觉）',
             'dorm_b_door':     '宿舍B（休息、睡觉）',
-            'kitchen_door':    '炊事房（吃饭、聊天、取暖）',
-            'workshop_door':   '工坊（维修、制作工具、学习）',
-            'furnace_plaza':   '暖炉广场（取暖、看演出、和人聊天）',
-            'lumber_yard':     '伐木场（砂柴、伐木）',
-            'ruins':           '废墟（探索、搜寻物资）',
+            'kitchen_door':    '炊事房（做饭→食物加工减少浪费，辅助效果，室内）',
+            'workshop_door':   '工坊（维修发电机→电力+8/h，制作工具，室内）',
+            'furnace_plaza':   '暖炉广场（取暖/安抚→恢复San值，维护暖炉→减少燃料消耗）',
+            'lumber_yard':     '伐木场（砍柴→木柴+10/h，户外，需体力）',
+            'lumber_camp':     '伐木营地（砍柴→木柴+10/h，户外，需体力）',
+            'frozen_lake':     '冰湖（捕鱼→食物+8/h，户外，需体力）',
+            'ruins':           '废墟（搜寻→建材+5/h，户外，需体力）',
+            'ruins_site':      '废墟采集场（搜集建材→建材+5/h，户外，需体力）',
         };
     }
 
@@ -5716,6 +7107,7 @@ _checkEatingArrival(dt, game) {
      * 与think()是两个独立调用，信息汇总后决策
      */
     async _actionDecision(game) {
+        if (this.isDead) return; // 💀 死亡NPC不做决策
         if (this._actionDecisionCooldown > 0) return;
         if (this.state === 'CHATTING') return;
         if (this.isSleeping) return;
@@ -5728,7 +7120,43 @@ _checkEatingArrival(dt, game) {
         // 【修复】正在走向聊天目标时，不做新的行动决策（防止打断社交走路）
         if (this._chatWalkTarget) return;
 
-        this._actionDecisionCooldown = this._actionDecisionInterval;
+        // 【硬保护】覆盖状态激活时跳过行动决策，防止LLM决策覆盖当前紧急行为
+        if (this._hungerOverride) {
+            this._logDebug('action', '[决策跳过] 处于饥饿覆盖中，跳过行动决策');
+            return;
+        }
+        if (this._stateOverride) {
+            this._logDebug('action', `[决策跳过] 处于状态覆盖(${this._stateOverride})中，跳过行动决策`);
+            return;
+        }
+        if (this._priorityOverride) {
+            this._logDebug('action', '[决策跳过] 处于P0紧急中，跳过行动决策');
+            return;
+        }
+        if (this._walkingToDoor) {
+            this._logDebug('action', '[决策跳过] 处于出门过程中，跳过行动决策');
+            return;
+        }
+        if (this._currentBehaviorLock) {
+            this._logDebug('action', `[决策跳过] 行为锁(${this._currentBehaviorLock.type})激活中，跳过行动决策`);
+            return;
+        }
+        if (this._restCooldownTimer > 0) {
+            this._logDebug('action', '[决策跳过] 处于休息缓冲期中，跳过行动决策');
+            return;
+        }
+
+        // 【优化】动态决策间隔：危急时缩短，平时保持原间隔
+        let dynamicInterval = this._actionDecisionInterval;
+        const inDanger = this.stamina < 20 || this.health < 30 || this.sanity < 25 || this.hunger < 30;
+        if (inDanger) {
+            // 属性危险状态：15~25秒
+            dynamicInterval = 15 + Math.random() * 10;
+        } else if (game.resourceSystem && game.resourceSystem.getResourceTension() > 0.5) {
+            // 资源紧张：20~40秒
+            dynamicInterval = 20 + Math.random() * 20;
+        }
+        this._actionDecisionCooldown = dynamicInterval;
 
         const map = game.maps[this.currentScene];
         const pos = this.getGridPos();
@@ -5823,6 +7251,10 @@ ${game.weatherSystem ? `\n【生存状况】${game.weatherSystem.getSurvivalSumm
 ${game.weatherSystem && game.weatherSystem.getBlizzardUrgencyForPrompt ? `\n${game.weatherSystem.getBlizzardUrgencyForPrompt()}` : ''}
 ${game.resourceSystem ? `资源: ${game.resourceSystem.getResourceStatusForPrompt()}` : ''}
 ${game.resourceSystem && game.resourceSystem.getUrgencyPrompt ? game.resourceSystem.getUrgencyPrompt() : ''}
+${game.resourceSystem && game.resourceSystem.getResourceForecastForPrompt ? game.resourceSystem.getResourceForecastForPrompt() : ''}
+${game.resourceSystem && game.resourceSystem.getSupplyRecommendationPrompt ? game.resourceSystem.getSupplyRecommendationPrompt() : ''}
+${game.weatherSystem && (game.weatherSystem.currentDay === 1 || game.weatherSystem.currentDay === 3) ? '\n⏰ 现在是补给窗口期，建议全力采集物资！' : ''}
+${game.resourceSystem ? `资源紧张度: ${game.resourceSystem.getResourceTension().toFixed(2)}/1.0${game.resourceSystem.getResourceTension() >= 0.3 ? '（紧张！减少社交，优先工作）' : game.resourceSystem.getResourceTension() >= 0.1 ? '（偏紧，注意资源）' : '（正常）'}` : ''}
 ${game.taskSystem ? `你的任务: ${game.taskSystem.getNpcTaskDescForPrompt(this.id)}` : ''}
 ${this.bodyTemp < 35 ? `🚨 你正在失温！体温: ${this.bodyTemp.toFixed(1)}°C` : ''}
 ${game.reincarnationSystem && game.reincarnationSystem.getLifeNumber() > 1 ? game.reincarnationSystem.getPastLifeHintForThinking(game.mode === 'reincarnation') : ''}
@@ -5837,9 +7269,11 @@ ${game.reincarnationSystem && game.reincarnationSystem.getLifeNumber() > 1 ? gam
 7. ${game.weatherSystem && game.weatherSystem.currentDay === 2 ? '⚠️ 户外连续工作不得超过2小时！超时会严重冻伤！' : ''}
 8. 如果有同伴倒下（严重失温/昏厥），你应该去救援他们。
 9. 优先级：生存紧急需求 > 任务完成 > 健康恢复 > 日常日程。
-10. type="work"表示你按当前日程/任务行动。但身心状态差时绝不要选work！
+10. type="work"表示按日程行动（⚠️日程行为多为辅助性质，资源紧张时不建议选择，应主动go_to到采集区产出资源）。身心状态差时绝不要选work！
 11. priority说明：urgent=生存紧急（生死相关）, normal=立即执行, low=仅记录意向。
 12. 下雨/大雪/暴风雪时不要去户外，应该选择室内场所。
+13. 资源紧张度>0.3时，体力型角色（体力>30）应优先选go_to到采集区产出资源（lumber_yard/frozen_lake/ruins），而不是stay/work做辅助工作。
+14. 你的角色专长：${this._getSpecialtyDescription()}，擅长的工作效率更高，优先选择擅长的任务。
 
 可选目标位置：
 ${targetList}
@@ -5848,11 +7282,11 @@ ${targetList}
 - go_to: 前往某地（必须指定target）
 - rest: 回家休息/睡觉
 - eat: 去炊事房吃饭（target选kitchen_door）
-- work: 继续按日程/任务行动（不需要target）
+- work: 按日程行动（⚠️日程行为多为辅助性质，资源紧张时不建议选择，应主动go_to到采集区）
 - accompany: 陪伴某人去某地（必须指定target和companion）
-- stay: 留在原地
-- wander: 随便走走`;
-
+- stay: 留在原地（仅当确实需要原地等待时使用）
+- wander: 随便走走（⚠️浪费时间，不推荐）
+`;
         const userPrompt = `当前时间：第${game.dayCount}天 ${game.getTimeStr()} ${game.getTimePeriod()}
 天气：${game.weatherSystem ? game.weatherSystem.getWeatherStr() : game.weather}
 温度：${game.weatherSystem ? game.weatherSystem.getEffectiveTemp() + '°C' : '未知'}
@@ -5876,6 +7310,10 @@ ${this.getGoalsSummary() ? `\n【你的目标】\n${this.getGoalsSummary()}\n→
 【最近记忆】
 ${recentMemories || '（暂无）'}
 
+${this._hungerOverride ? '🍽️ 【重要】我正在去吃饭/正在吃饭中！除非有更紧急的事（如失温/濒死），否则不要改变目标，选eat！' : ''}
+${this._taskOverride && this._taskOverride.isActive ? `📋 【重要】我正在执行任务：${this._taskOverride.taskId}，前往${this._taskOverride.targetLocation}，不要中途改道` : ''}
+${this._stateOverride ? `🚨 我正在紧急处理状态覆盖：${this._stateOverride}，选rest！` : ''}
+${this._priorityOverride ? `⚠️ 当前P0紧急状态：${this._priorityOverride}，必须优先处理！` : ''}
 【全镇NPC状态】
 ${allNPCStatus}
 ${friendCrisisHint}
@@ -6028,6 +7466,11 @@ ${friendCrisisHint}
         }
 
         // 清除之前的行动状态
+        // 【休息缓冲期】新行动执行时清除缓冲期，允许urgent等新行动打断休息
+        if (this._restCooldownTimer > 0) {
+            console.log(`[休息打断] ${this.name} 收到新行动 ${action.type}(${action.priority || 'normal'})，打断休息缓冲期`);
+            this._restCooldownTimer = 0;
+        }
         this._clearActionOverride();
 
         // 【修复】清除社交走路目标（行动执行优先于社交意愿）
@@ -6038,6 +7481,12 @@ ${friendCrisisHint}
 
         this._currentAction = action;
         this._actionOverride = true;
+        // 【覆盖快照】设置行动覆盖
+        const oldOverrideA = this._activeOverride;
+        this._activeOverride = 'action';
+        if (oldOverrideA !== 'action') {
+            this._logDebug('override', `[覆盖切换] ${oldOverrideA} → action（原因: ${action.type}）`);
+        }
         this._actionStuckTimer = 0;
         this._actionTravelTimer = 0;
         // 【Debug日志】记录行动执行
@@ -6047,6 +7496,13 @@ ${friendCrisisHint}
         this.currentPath = [];
         this.isMoving = false;
         this._pendingEnterScene = null;
+
+        // 【硬保护B6】go_to kitchen_door 且饥饿时自动转换为 eat
+        if (action.type === 'go_to' && action.target === 'kitchen_door' && this.hunger < 50 && !this.isEating) {
+            console.log(`[行动转换] ${this.name} go_to kitchen_door 自动转换为 eat (hunger=${Math.round(this.hunger)})`);
+            this._logDebug('action', `[行动转换] go_to kitchen_door → eat (hunger=${Math.round(this.hunger)})`);
+            action.type = 'eat';
+        }
 
         switch (action.type) {
             case 'go_to':
@@ -6085,15 +7541,27 @@ ${friendCrisisHint}
                 }
                 break;
 
-            case 'work':
-                // 恢复日程
-                this._clearActionOverride();
-                this.currentScheduleIdx = -1; // 强制日程系统重新评估
-                this.scheduleReached = false;
+            case 'work': {
+                // 【优化】work不再空操作，优先检查任务系统，其次回退到角色默认行为
+                const currentTask = game.taskSystem?.getCurrentTask?.(this.id);
+                if (currentTask && currentTask.targetLocation) {
+                    // 有任务系统分配的任务，激活taskOverride导航到任务目标
+                    this._actionTarget = { target: currentTask.targetLocation, desc: currentTask.desc };
+                    this.stateDesc = currentTask.desc;
+                    this._logDebug('action', `work→任务系统: ${currentTask.desc} → ${currentTask.targetLocation}`);
+                    this._navigateToScheduleTarget(currentTask.targetLocation, game);
+                    this.scheduleReached = false;
+                } else {
+                    // 无任务分配，回退到角色默认生产行为
+                    this._fallbackToRoleDefaultAction(game);
+                }
                 return;
+            }
 
             case 'stay':
+                // 【优化】确保stateDesc有效，使_updateActionEffect能匹配关键词效果
                 this.stateDesc = action.reason || '待在原地';
+                this._logDebug('action', `stay: stateDesc="${this.stateDesc}"`);
                 this._clearActionOverride();
                 return;
 
@@ -6186,6 +7654,7 @@ ${friendCrisisHint}
         companion._isCompanion = true;
         companion._companionLeader = this.id;
         companion._companionDestination = action.target;
+        companion._companionStartTime = Date.now();
         companion._actionOverride = true;
         companion._currentAction = { ...action, type: 'go_to', reason: `陪${this.name}一起去` };
         companion._actionTarget = { target: action.target, desc: `陪${this.name}去${action.reason}` };
@@ -6228,6 +7697,7 @@ ${friendCrisisHint}
         companion._isCompanion = true;
         companion._companionLeader = this.id;
         companion._companionDestination = targetKey;
+        companion._companionStartTime = Date.now();
         companion._actionOverride = true;
         companion._actionTarget = { target: targetKey, desc: `跟${this.name}同行` };
         companion.stateDesc = `跟着${this.name}一起走`;
@@ -6241,6 +7711,38 @@ ${friendCrisisHint}
 
         if (game.addEvent) {
             game.addEvent(`🤝 ${companion.name} 跟着 ${this.name} 一起走`);
+        }
+    }
+
+    /**
+     * 【任务3】角色默认生产行为回退 — 当LLM返回work但无任务分配时，根据角色自动选择有意义的行为
+     */
+    _fallbackToRoleDefaultAction(game) {
+        // 角色→默认行为映射表
+        const ROLE_DEFAULT_ACTIONS = {
+            'li_shen':      { target: 'kitchen_door',   desc: '去炊事房做饭',         stateDesc: '准备晚餐、分配食物' },
+            'zhao_chef':    { target: 'lumber_camp',    desc: '去伐木场砍柴',         stateDesc: '砍柴' },
+            'wang_teacher': { target: 'workshop_door',  desc: '去工坊维修发电机',     stateDesc: '维修发电机' },
+            'su_doctor':    { target: 'medical_door',   desc: '去医疗站坐诊',         stateDesc: '坐诊' },
+            'old_qian':     { target: 'furnace_plaza',  desc: '去暖炉广场安抚大家',   stateDesc: '安抚' },
+            'ling_yue':     { target: 'ruins_site',     desc: '去废墟侦察',           stateDesc: '废墟' },
+            'lu_chen':      { target: 'lumber_camp',    desc: '去伐木场搬运',         stateDesc: '搬运木柴' },
+            'qing_xuan':    { target: 'medical_door',   desc: '去医疗站制作草药',     stateDesc: '制作草药' },
+        };
+
+        const defaultAction = ROLE_DEFAULT_ACTIONS[this.id];
+        if (defaultAction) {
+            this._actionTarget = { target: defaultAction.target, desc: defaultAction.desc };
+            this.stateDesc = defaultAction.stateDesc;
+            this._logDebug('action', `work→角色默认行为: ${this.name} → ${defaultAction.desc} (${defaultAction.target})`);
+            this._navigateToScheduleTarget(defaultAction.target, game);
+            this.scheduleReached = false;
+        } else {
+            // 未知角色，回退到日程系统
+            this._logDebug('action', `work→未知角色${this.id}，恢复日程`);
+            this._clearActionOverride();
+            this.currentScheduleIdx = -1;
+            this.scheduleReached = false;
         }
     }
 
@@ -6259,14 +7761,33 @@ ${friendCrisisHint}
             this._executeAction(pa, game);
         }
 
-        // 同伴模式到达检测
+        // 同伴模式到达检测 + 超时释放
         if (this._isCompanion && this._companionDestination) {
-            this._checkCompanionArrival(dt, game);
+            // 【修复】companion超时释放：跟随超过120秒（约2游戏小时）未到达则自动清除，恢复自主行为
+            const companionElapsed = (Date.now() - this._companionStartTime) / 1000;
+            if (companionElapsed > 120) {
+                console.warn(`[NPC-${this.name}] companion跟随超时(${companionElapsed.toFixed(0)}s)，自动释放`);
+                if (game.addEvent) {
+                    const leader = game.npcs.find(n => n.id === this._companionLeader);
+                    game.addEvent(`⏰ ${this.name}跟不上${leader ? leader.name : '同伴'}，决定自行行动`);
+                }
+                this._clearCompanionState();
+                this._clearActionOverride();
+                this.currentScheduleIdx = -1;
+                this.scheduleReached = false;
+            } else {
+                this._checkCompanionArrival(dt, game);
+            }
         }
 
         // 行动覆盖中 → 检查到达和卡住
         // 【一致性保护】检测_actionOverride与_actionTarget状态不一致
+        // 【休息缓冲期例外】缓冲期中_actionTarget已被清除但_actionOverride保持，这是正常状态
         if (this._actionOverride && !this._actionTarget) {
+            if (this._restCooldownTimer > 0) {
+                // 休息缓冲期中，_actionTarget=null是预期行为，直接return不做到达检测
+                return;
+            }
             console.warn(`[NPC-${this.name}] [一致性修复] _actionOverride=true但_actionTarget=null，自动清除`);
             this._clearActionOverride();
             return;
@@ -6426,18 +7947,26 @@ ${friendCrisisHint}
                     const isNightTime = this._isBedtime(restHour);
                     if (isNightTime) {
                         this.isSleeping = true;
+                        this._forcedSleep = false; // 夜间正常入睡，非强制
                         this.stateDesc = '回家睡觉了';
                         this.expression = 'Zzz...';
                         this.expressionTimer = 8;
+                        // AI模式日志：行动到达后入睡
+                        if (this.game && this.game.aiModeLogger) {
+                            const snap = AIModeLogger.npcAttrSnapshot(this);
+                            this.game.aiModeLogger.log('SLEEP_START', `${this.name} 回家睡觉 | ${snap} | ${this.currentScene || '?'}`);
+                        }
                     } else {
-                        // 白天只是休息，恢复一些体力，不进入睡眠状态
-                        this.stamina = Math.min(100, this.stamina + 15);
-                        this.stateDesc = '在家休息了一会儿';
+                        // 【硬保护B4】白天只是休息，体力在缓冲期内渐进恢复，不再瞬间恢复
+                        // 移除了原来的 this.stamina += 15 瞬间恢复
+                        this.stateDesc = '在家休息中';
                         this.expression = '休息一下，恢复精力~';
                         this.expressionTimer = 5;
-                        console.log(`[行动到达] ${this.name} 白天到家休息，恢复体力但不入睡`);
-                    }
-                }
+                        // 【行为锁优化】白天休息改为条件驱动缓冲期：体力>=40或60秒游戏时间
+                        this._restCooldownTimer = 60;
+                        // 【行为锁】获取休息行为锁（优先级2=恢复行为）
+                        this._acquireBehaviorLock('resting', BEHAVIOR_PRIORITY.RECOVERY);
+                        console.log(`[行动到达] ${this.name} 白天到家休息，进入休息缓冲期(体力>=40或60s)，体力渐进恢复中`);                    }                }
                 break;
 
             case 'eat':
@@ -6452,8 +7981,15 @@ ${friendCrisisHint}
                 // 普通到达
                 this.expression = action.reason || '到了';
                 this.expressionTimer = 5;
+                // 【硬保护B6兜底】到达kitchen场景且饥饿时自动触发进食
+                if (this.currentScene === 'kitchen' && this.hunger < 50 && !this.isEating) {
+                    console.log(`[行动兜底] ${this.name} go_to到达kitchen且饥饿(${Math.round(this.hunger)})，自动开始吃饭`);
+                    this._logDebug('action', `[行动兜底] go_to到达kitchen，自动开始吃饭`);
+                    this._startEating(game);
+                    this._hungerOverride = true;
+                }
                 // 【修复】accompany到达后自动和companion发起对话
-                if (action.type === 'accompany' && this._companionTarget && game.dialogueManager) {
+                if (CHAT_ENABLED && action.type === 'accompany' && this._companionTarget && game.dialogueManager) {
                     const comp = game.npcs.find(n => n.id === this._companionTarget);
                     if (comp && comp.currentScene === this.currentScene 
                         && comp.state !== 'CHATTING' && this.state !== 'CHATTING'
@@ -6472,9 +8008,21 @@ ${friendCrisisHint}
         }
 
         // 清除行动覆盖，让日程系统重新接管
-        this._clearActionOverride();
-        this.currentScheduleIdx = -1;
-        this.scheduleReached = false;
+        // 【休息缓冲期】如果正在休息缓冲期，不完全清除行动覆盖，保持NPC留在宿舍
+        if (this._restCooldownTimer > 0) {
+            this.scheduleReached = true; // 标记为已到达，防止日程系统重新导航
+            // 【修复】必须清除_actionTarget和_currentAction，否则_updateActionOverride
+            // 每帧都会因为_actionOverride=true且_actionTarget存在而重新检测到达，
+            // 导致_onActionArrived被无限循环调用（清璇发疯bug）
+            this._actionTarget = null;
+            this._currentAction = null;
+            // 保留_actionOverride=true，防止日程系统在缓冲期内接管
+            console.log(`[休息缓冲] ${this.name} 正在休息缓冲期，清除行动目标但保持覆盖状态`);
+        } else {
+            this._clearActionOverride();
+            this.currentScheduleIdx = -1;
+            this.scheduleReached = false;
+        }
 
         if (game.addEvent) {
             game.addEvent(`✅ ${this.name} 完成行动：${action.reason || action.type}`);
@@ -6517,7 +8065,7 @@ ${friendCrisisHint}
                 this.changeAffinity(leader.id, 2);
                 leader.changeAffinity(this.id, 2);
                 // 【修复】companion到达后自动和leader发起对话
-                if (game.dialogueManager && leader.currentScene === this.currentScene
+                if (CHAT_ENABLED && game.dialogueManager && leader.currentScene === this.currentScene
                     && leader.state !== 'CHATTING' && this.state !== 'CHATTING'
                     && this._canChatWith(leader)) {
                     const self = this;
@@ -6540,11 +8088,19 @@ ${friendCrisisHint}
 
     /** 清除行动覆盖状态 */
     _clearActionOverride() {
+        const wasActive = this._actionOverride;
         this._actionOverride = false;
         this._currentAction = null;
         this._actionTarget = null;
         this._actionStuckTimer = 0;
         this._actionTravelTimer = 0;
+        // 【覆盖快照】清除时重置_activeOverride并检查pending队列
+        if (wasActive && this._activeOverride === 'action') {
+            const old = this._activeOverride;
+            this._activeOverride = 'none';
+            this._logDebug('override', `[覆盖切换] ${old} → none（原因: 行动覆盖清除）`);
+            this._executePendingBehavior();
+        }
     }
 
     /** 清除同伴状态 */
@@ -6553,6 +8109,107 @@ ${friendCrisisHint}
         this._companionLeader = null;
         this._companionDestination = null;
         this._companionTarget = null;
+    }
+
+    // ============ 行为完成统一回调 ============
+
+    /**
+     * 吃饭行为完成的统一回调
+     * 按需求6.1的顺序执行清理
+     */
+    _onEatingComplete() {
+        this._logDebug('override', `[行为完成] 吃饭完成`);
+        // 1. 恢复饱腹值已在调用前处理
+        // 2. 清除所有饥饿相关状态
+        this.isEating = false;
+        this._hungerOverride = false;
+        this._hungerTarget = null;
+        this._hungerStuckTimer = 0;
+        this._hungerTravelTimer = 0;
+        // 3. 重置覆盖快照
+        if (this._activeOverride === 'hunger') {
+            this._activeOverride = 'none';
+        }
+        // 4. 释放行为锁（内部会检查pending队列）
+        this._releaseBehaviorLock('eating');
+        // 5. 如果pending队列为空，交还日程系统
+        if (this._pendingBehaviors.length === 0) {
+            this.currentScheduleIdx = -1;
+            this.scheduleReached = false;
+        }
+    }
+
+    /**
+     * 休息行为完成的统一回调
+     * 按需求6.2的顺序执行清理
+     */
+    _onRestComplete() {
+        this._logDebug('override', `[行为完成] 休息完成，体力${Math.round(this.stamina)}`);
+        // 1. 清除行动覆盖相关状态
+        this._clearActionOverride();
+        // 2. 释放行为锁
+        this._releaseBehaviorLock('resting');
+        // 3. 重置日程索引，强制日程重新匹配
+        this.currentScheduleIdx = -1;
+        this.scheduleReached = false;
+        // 4. pending队列已在_releaseBehaviorLock中检查
+    }
+
+    /**
+     * 状态覆盖行为完成的统一回调
+     * 按需求6.3的顺序执行清理
+     */
+    _onStateOverrideComplete() {
+        const type = this._stateOverride;
+        this._logDebug('override', `[行为完成] 状态覆盖(${type})完成`);
+        // 清除所有stateOverride相关字段
+        this._clearStateOverride();
+        // 重置日程
+        this.currentScheduleIdx = -1;
+        this.scheduleReached = false;
+    }
+
+    /**
+     * 清除所有覆盖状态的兜底方法
+     * 在极端情况下（NPC卡死>60秒）一键清除所有状态并恢复日程控制
+     */
+    _clearAllOverrides() {
+        console.warn(`[${this.name}] _clearAllOverrides() 执行，清除所有覆盖状态`);
+        this._logDebug('override', `[兜底] _clearAllOverrides 清除所有覆盖状态`);
+        
+        // 清除饥饿覆盖
+        this._hungerOverride = false;
+        this._hungerTarget = null;
+        this._hungerStuckTimer = 0;
+        this._hungerTravelTimer = 0;
+        this.isEating = false;
+        this.eatingTimer = 0;
+        
+        // 清除状态覆盖
+        this._clearStateOverride();
+        
+        // 清除行动覆盖
+        this._clearActionOverride();
+        
+        // 清除资源采集覆盖
+        this._resourceGatherOverride = false;
+        this._resourceGatherTarget = null;
+        this._resourceGatherType = null;
+        this._resourceGatherTravelTimer = 0;
+        
+        // 清除任务覆盖
+        if (this._taskOverride) {
+            this._taskOverride.isActive = false;
+        }
+        
+        // 清除行为锁和pending队列
+        this._currentBehaviorLock = null;
+        this._pendingBehaviors = [];
+        this._activeOverride = 'none';
+        
+        // 恢复日程控制
+        this.currentScheduleIdx = -1;
+        this.scheduleReached = false;
     }
 
     /** 构建经营上下文信息（店主角色专用） */
@@ -6606,18 +8263,56 @@ ${friendCrisisHint}
         const cooldown = (this.id === 'old_qian') ? 30000 : 60000;
         if ((now - lastChat) <= cooldown) return false;
 
-        // 【新增】资源紧急度检查 — critical时禁止聊天，warning时大幅降低概率
+        // 【新增】taskOverride 工作中禁止聊天（紧急/高优先级任务中不闲聊）
+        if (this._taskOverride && this._taskOverride.isActive) {
+            this._logDebug && this._logDebug('chat', `正在执行taskOverride任务，禁止与${other.name}聊天`);
+            return false;
+        }
+        if (other._taskOverride && other._taskOverride.isActive) {
+            this._logDebug && this._logDebug('chat', `${other.name}正在执行taskOverride任务，禁止聊天`);
+            return false;
+        }
+
+        // 【新增】生产性工作中禁止聊天（检查当前日程是否命中 ACTION_EFFECT_MAP 中的生产性行为）
+        // 老钱的安抚/调解/鼓舞等工作属于其正当职责，豁免此限制
+        const _isInProductiveWork = (npc) => {
+            if (!npc._currentActionEffect) return false;
+            const effect = npc._currentActionEffect;
+            // 老钱的 morale_boost（安抚鼓舞）不算闲聊，但算正当工作，不限制
+            if (npc.id === 'old_qian' && effect.effectType === 'morale_boost') return false;
+            // 有实际产出的工作类型
+            const productiveTypes = ['produce_resource', 'build_progress', 'craft_medkit', 'repair_radio', 'medical_heal', 'reduce_waste'];
+            return productiveTypes.includes(effect.effectType);
+        };
+        if (_isInProductiveWork(this)) {
+            this._logDebug && this._logDebug('chat', `正在生产性工作（${this._currentActionEffect.effectType}），禁止与${other.name}聊天`);
+            return false;
+        }
+        if (_isInProductiveWork(other)) {
+            this._logDebug && this._logDebug('chat', `${other.name}正在生产性工作，禁止聊天`);
+            return false;
+        }
+
+        // 【优化】基于 getResourceTension() 统一控制聊天——替换分散的 urgency 判断
         const game = this.game || (typeof window !== 'undefined' && window.game);
         if (game && game.resourceSystem) {
-            const urgency = game.resourceSystem.getResourceUrgency();
-            const hasCritical = urgency.wood === 'critical' || urgency.food === 'critical' || urgency.power === 'critical';
-            if (hasCritical) {
-                this._logDebug && this._logDebug('chat', `资源critical，禁止与${other.name}聊天`);
+            const tension = game.resourceSystem.getResourceTension();
+            if (tension >= 0.3) {
+                // 中高紧张度：完全禁止聊天
+                // 老钱作为精神领袖的安抚行为豁免（他的"聊天"实际上是工作）
+                if (this.id === 'old_qian') {
+                    const desc = this.stateDesc || '';
+                    if (/安抚|调解|鼓舞|安慰|心理支持|讲故事/.test(desc)) {
+                        // 老钱的安抚工作不受限
+                        return true;
+                    }
+                }
+                this._logDebug && this._logDebug('chat', `资源紧张度${tension.toFixed(2)}>=0.3，禁止与${other.name}聊天`);
                 return false;
             }
-            const hasWarning = urgency.wood === 'warning' || urgency.food === 'warning' || urgency.power === 'warning';
-            if (hasWarning && Math.random() > 0.3) {
-                this._logDebug && this._logDebug('chat', `资源warning，聊天概率降低，跳过与${other.name}聊天`);
+            if (tension >= 0.1 && Math.random() > 0.3) {
+                // 轻度紧张：70%概率禁止
+                this._logDebug && this._logDebug('chat', `资源紧张度${tension.toFixed(2)}>=0.1，聊天概率降低，跳过与${other.name}聊天`);
                 return false;
             }
         }
@@ -6703,9 +8398,16 @@ ${friendCrisisHint}
             _hypothermiaDuration: this._hypothermiaDuration,
             _isDying: this._isDying,
             _dyingTimer: this._dyingTimer,
+            // 强制睡眠状态
+            _forcedSleep: this._forcedSleep,
+            _forcedSleepTimer: this._forcedSleepTimer,
             // 任务驱动覆盖系统
             _taskOverride: { ...this._taskOverride },
             _behaviorPriority: this._behaviorPriority,
+            // 统一行为锁系统
+            _currentBehaviorLock: this._currentBehaviorLock ? { ...this._currentBehaviorLock } : null,
+            _pendingBehaviors: this._pendingBehaviors ? this._pendingBehaviors.map(b => ({ type: b.type, priority: b.priority })) : [],
+            _activeOverride: this._activeOverride || 'none',
         };
     }
 
@@ -6743,10 +8445,37 @@ ${friendCrisisHint}
         if (data._hypothermiaDuration !== undefined) this._hypothermiaDuration = data._hypothermiaDuration;
         if (data._isDying !== undefined) this._isDying = data._isDying;
         if (data._dyingTimer !== undefined) this._dyingTimer = data._dyingTimer;
+        // 强制睡眠状态恢复
+        if (data._forcedSleep !== undefined) this._forcedSleep = data._forcedSleep;
+        if (data._forcedSleepTimer !== undefined) this._forcedSleepTimer = data._forcedSleepTimer;
         // 任务驱动覆盖系统恢复
         if (data._taskOverride) {
             this._taskOverride = { ...this._taskOverride, ...data._taskOverride };
         }
         if (data._behaviorPriority) this._behaviorPriority = data._behaviorPriority;
+        // 统一行为锁系统恢复
+        if (data._currentBehaviorLock) {
+            // 格式校验：确保有必要字段
+            if (data._currentBehaviorLock.type && typeof data._currentBehaviorLock.priority === 'number' && typeof data._currentBehaviorLock.startTime === 'number') {
+                // 安全网检查：如果锁持续时间超过120秒，自动释放
+                const lockAge = this.game ? (this.game.gameTime - data._currentBehaviorLock.startTime) : 0;
+                if (lockAge > 120) {
+                    console.warn(`[反序列化] ${this.name} 行为锁 ${data._currentBehaviorLock.type} 已过期(${lockAge.toFixed(0)}秒)，自动释放`);
+                    this._currentBehaviorLock = null;
+                } else {
+                    this._currentBehaviorLock = { ...data._currentBehaviorLock };
+                }
+            } else {
+                console.warn(`[反序列化] ${this.name} 行为锁数据格式异常，忽略`);
+                this._currentBehaviorLock = null;
+            }
+        }
+        if (data._pendingBehaviors && Array.isArray(data._pendingBehaviors)) {
+            // pending队列仅恢复type和priority，callback不可序列化
+            this._pendingBehaviors = data._pendingBehaviors
+                .filter(b => b && b.type && typeof b.priority === 'number')
+                .slice(0, 3);
+        }
+        if (data._activeOverride) this._activeOverride = data._activeOverride;
     }
 }

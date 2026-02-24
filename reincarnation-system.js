@@ -12,13 +12,21 @@ class ReincarnationSystem {
     constructor(game) {
         this.game = game;
 
-        // 从 localStorage 加载历史轮回记忆
+        // 非轮回模式（agent/debug）不加载历史轮回数据，强制第1世
+        if (game.mode !== 'reincarnation') {
+            this.pastLives = [];
+            this.currentLifeNumber = 1;
+            console.log(`[ReincarnationSystem] 非轮回模式(${game.mode})，强制第1世，不加载历史记忆`);
+            return;
+        }
+
+        // 轮回模式：从 localStorage 加载历史轮回记忆
         this.pastLives = this.loadPastLives();
 
         // 从独立存储读取世数（不再从pastLives.length推导，因为pastLives有上限裁剪）
         this.currentLifeNumber = this._loadLifeNumber();
 
-        console.log(`[ReincarnationSystem] 初始化完成，当前第${this.currentLifeNumber}世，历史${this.pastLives.length}条记忆`);
+        console.log(`[ReincarnationSystem] 轮回模式初始化完成，当前第${this.currentLifeNumber}世，历史${this.pastLives.length}条记忆`);
     }
 
     // ============ localStorage 读写 ============

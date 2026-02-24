@@ -42,6 +42,9 @@ class EventSystem {
         // 老钱调解冷却
         this._mediationCooldown = 0;
 
+        // 老钱主动安抚冷却（独立于调解）
+        this._qianMoraleCooldown = 0;
+
         console.log('[EventSystem] 初始化完成');
     }
 
@@ -51,6 +54,7 @@ class EventSystem {
         this._tick += gameDt;
         this._moraleCooldown = Math.max(0, this._moraleCooldown - gameDt);
         this._mediationCooldown = Math.max(0, this._mediationCooldown - gameDt);
+        this._qianMoraleCooldown = Math.max(0, this._qianMoraleCooldown - gameDt);
 
         // 更新冷却
         for (const key in this.cooldowns) {
@@ -82,6 +86,9 @@ class EventSystem {
 
         // ---- 凌玥自动鼓舞士气 ----
         this._checkMoraleBoost(aliveNpcs);
+
+        // ---- 老钱主动安抚（独立于调解） ----
+        this._checkQianMoraleBoost(aliveNpcs);
 
         // ---- 老钱自动调解 ----
         this._checkMediation(aliveNpcs);
@@ -248,6 +255,38 @@ class EventSystem {
 
         if (this.game.addEvent) {
             this.game.addEvent(`🎵✨ ${line}（同场景所有人San+10）`);
+        }
+    }
+
+    /** 老钱主动安抚：当同场景有NPC的San<40时自动触发，独立冷却1小时 */
+    _checkQianMoraleBoost(aliveNpcs) {
+        if (this._qianMoraleCooldown > 0) return;
+
+        const oldQian = aliveNpcs.find(n => n.id === 'old_qian');
+        if (!oldQian || oldQian.isDead || oldQian.stamina < 15) return;
+
+        // 同场景有NPC的San<40才触发
+        const sameScene = aliveNpcs.filter(n => n.currentScene === oldQian.currentScene && n.id !== oldQian.id);
+        const lowSanInScene = sameScene.filter(n => n.sanity < 40);
+        if (lowSanInScene.length === 0) return;
+
+        // 触发安抚：1小时冷却
+        this._qianMoraleCooldown = 3600;
+
+        // 同场景所有NPC（含老钱自己）San+8
+        const allInScene = aliveNpcs.filter(n => n.currentScene === oldQian.currentScene);
+        for (const npc of allInScene) {
+            npc.sanity = Math.min(100, npc.sanity + 8);
+        }
+
+        // 老钱体力消耗
+        oldQian.stamina = Math.max(0, oldQian.stamina - 10);
+
+        const line = `老钱安抚了大家的情绪："大家别慌，我们一定能撑过去的！"`;
+        this._recordEvent(EVENT_TYPES.MORALE_BOOST, line, allInScene.map(n => n.id));
+
+        if (this.game.addEvent) {
+            this.game.addEvent(`💬 ${line}（同场景所有人San+8）`);
         }
     }
 
@@ -466,6 +505,7 @@ class EventSystem {
             day4Locked: this._day4Locked,
             moraleCooldown: this._moraleCooldown,
             mediationCooldown: this._mediationCooldown,
+            qianMoraleCooldown: this._qianMoraleCooldown,
         };
     }
 
@@ -476,5 +516,6 @@ class EventSystem {
         this._day4Locked = data.day4Locked || false;
         this._moraleCooldown = data.moraleCooldown || 0;
         this._mediationCooldown = data.mediationCooldown || 0;
+        this._qianMoraleCooldown = data.qianMoraleCooldown || 0;
     }
 }

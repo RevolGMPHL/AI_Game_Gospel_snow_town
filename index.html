@@ -58,6 +58,13 @@
                     <div class="btn-sub">WASD 移动 / 检查碰撞</div>
                 </button>
             </div>
+            <!-- 轮回模式状态提示（由JS动态填充） -->
+            <div id="reincarnation-status-hint" style="display:none; text-align:center; margin-top:12px; font-size:13px; color:#c084fc;">
+                <span id="reincarnation-hint-text"></span>
+                <label style="display:inline-flex; align-items:center; gap:4px; margin-left:12px; cursor:pointer; color:#aaa; font-size:12px;">
+                    <input type="checkbox" id="chk-reset-reincarnation"> 从第1世重新开始
+                </label>
+            </div>
         </div>
     </div>
 
@@ -141,6 +148,11 @@
                 <span class="res-bar-label">建材</span>
                 <span class="res-bar-gauge"><div class="res-bar-fill" id="res-material-fill" style="width:20%"></div></span>
                 <span class="res-bar-val" id="res-material-val">10</span>
+            </div>
+            <div class="res-bar-item res-bar-item-medkit">
+                <span class="res-bar-icon">💊</span>
+                <span class="res-bar-label">急救包</span>
+                <span class="res-bar-val" id="res-medkit-val">0</span>
             </div>
             <div class="res-bar-divider"></div>
             <div class="res-bar-item">
@@ -252,6 +264,7 @@
     <script src="event-system.js"></script>
     <script src="npc.js"></script>
     <script src="dialogue.js"></script>
+    <script src="aimode-logger.js"></script>
     <script src="game.js"></script>
 </body>
 </html>

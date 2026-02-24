@@ -382,14 +382,21 @@ class Game {
 
         // ============ 极寒生存系统初始化 ============
         this.weatherSystem = (typeof WeatherSystem !== 'undefined') ? new WeatherSystem(this) : null;
+        // 【修复】初始化时同步WeatherSystem天气到game.weather，避免两套天气系统冲突
+        if (this.weatherSystem) {
+            this.weather = this.weatherSystem.currentWeather;
+        }
         this.resourceSystem = (typeof ResourceSystem !== 'undefined') ? new ResourceSystem(this) : null;
         this.furnaceSystem = (typeof FurnaceSystem !== 'undefined') ? new FurnaceSystem(this) : null;
         this.deathSystem = (typeof DeathSystem !== 'undefined') ? new DeathSystem(this) : null;
         this.taskSystem = (typeof TaskSystem !== 'undefined') ? new TaskSystem(this) : null;
         this.eventSystem = (typeof EventSystem !== 'undefined') ? new EventSystem(this) : null;
 
-        // 轮回记忆系统
+        // 轮回记忆系统（非轮回模式下构造函数内部自动强制第1世）
         this.reincarnationSystem = (typeof ReincarnationSystem !== 'undefined') ? new ReincarnationSystem(this) : null;
+
+        // AI模式日志系统（仅 agent/reincarnation 模式下启用）
+        this.aiModeLogger = (this.isAgentMode && typeof AIModeLogger !== 'undefined') ? new AIModeLogger(this) : null;
 
         // ============ 全局物品/状态系统 ============
         // 急救包系统
@@ -659,6 +666,27 @@ console.log(`🏘️ 福音镇已启动！模式: ${mode}`);
             this._updateResBar('res-food-fill', 'res-food-val', rs.food, maxFood);
             this._updateResBar('res-power-fill', 'res-power-val', rs.power, maxPower);
             this._updateResBar('res-material-fill', 'res-material-val', rs.material, maxMaterial);
+
+            // 急救包数量显示
+            const medkitVal = document.getElementById('res-medkit-val');
+            if (medkitVal) {
+                const count = this._medkitCount || 0;
+                medkitVal.textContent = count;
+                medkitVal.style.color = count === 0 ? '#f87171' : '';
+            }
+            // 急救包不足提示（每60秒最多提示一次）
+            if (this._medkitCount <= 0) {
+                const hasLowHpNpc = this.npcs.some(n => !n.isDead && n.health < 30);
+                if (hasLowHpNpc) {
+                    const now = Date.now();
+                    if (!this._medkitLastWarnTime || (now - this._medkitLastWarnTime) >= 60000) {
+                        this.addEvent('⚠️ 急救包不足！需要药剂师制作急救包');
+                        this._medkitLastWarnTime = now;
+                    }
+                }
+            } else {
+                this._medkitLastWarnTime = 0;
+            }
         }
         if (this.taskSystem) {
             const taskEl = document.getElementById('task-progress-val');
@@ -1341,7 +1369,9 @@ const resp = await fetch('http://localhost:8080/api/save-debug-log', {
         // 按场景分组，对所有场景都做碰撞检测，而不只是摄像机当前场景
         const sceneGroups = {};
         for (const n of this.npcs) {
+            if (n.isDead) continue;  // 死亡NPC不参与碰撞
             if (n.isSleeping) continue;
+            if (n.isEating) continue;  // 吃饭中NPC不参与碰撞（与睡觉对齐）
             if (!sceneGroups[n.currentScene]) sceneGroups[n.currentScene] = [];
             sceneGroups[n.currentScene].push(n);
         }
@@ -1353,7 +1383,7 @@ const resp = await fetch('http://localhost:8080/api/save-debug-log', {
         }
 
         // 气泡偏移只计算当前场景
-        const visibleNPCs = this.npcs.filter(n => n.currentScene === this.currentScene && !n.isSleeping);
+const visibleNPCs = this.npcs.filter(n => n.currentScene === this.currentScene && !n.isSleeping && !n.isEating && !n.isDead);
         this._computeBubbleOffsets(visibleNPCs, minDist);
     }
 
@@ -1379,9 +1409,15 @@ const resp = await fetch('http://localhost:8080/api/save-debug-log', {
                     const ny = dy / dist;
                     const push = overlap * pushStrength * 0.5;
 
-                    // 正在移动的NPC被推少一些
-                    const aMoving = a.isMoving ? 0.3 : 0.7;
-                    const bMoving = b.isMoving ? 0.3 : 0.7;
+                    // 正在移动的NPC被推少一些；吃饭/治疗中的NPC不可推动；持有行为锁的NPC大幅减少推力
+                    let aMoving = a.isMoving ? 0.3 : 0.7;
+                    let bMoving = b.isMoving ? 0.3 : 0.7;
+                    // 吃饭/治疗中的NPC完全不可推动
+                    if (a.isEating || a._isBeingTreated) aMoving = 0;
+                    if (b.isEating || b._isBeingTreated) bMoving = 0;
+                    // 持有行为锁且不在移动的NPC大幅减少推力
+                    if (!a.isMoving && a._currentBehaviorLock && aMoving > 0) aMoving = 0.1;
+                    if (!b.isMoving && b._currentBehaviorLock && bMoving > 0) bMoving = 0.1;
 
                     // 保存推挤前的位置
                     const aOldX = a.x, aOldY = a.y;
@@ -1435,11 +1471,21 @@ const resp = await fetch('http://localhost:8080/api/save-debug-log', {
 
                         // 【增强】碰撞持续超过2.5秒 → 强制传送脱困（解决室内死锁）
                         if (a.collisionStallTimer > 2.5 && b.collisionStallTimer > 2.5) {
-                            const teleported = this._forceUnstuck(a, b, map);
-                            if (teleported) {
-                                console.log(`[碰撞脱困] ${a.name} 和 ${b.name} 碰撞死锁${a.collisionStallTimer.toFixed(1)}秒，强制脱困`);
-                                if (this.addEvent) {
-                                    this.addEvent(`⚠️ ${a.name} 和 ${b.name} 在${a.currentScene}卡住了，强制脱困`);
+                            // 【修复】双方都有保护状态时跳过传送，仅使用推力
+                            const aProtected = a.isEating || a.isSleeping || a._isBeingTreated || a._currentBehaviorLock;
+                            const bProtected = b.isEating || b.isSleeping || b._isBeingTreated || b._currentBehaviorLock;
+                            if (aProtected && bProtected) {
+                                // 双方都有保护，不传送，仅给轻微推力
+                                if (a.collisionStallTimer > 10) {
+                                    console.warn(`[碰撞警告] ${a.name} 和 ${b.name} 双方都有行为锁，无法脱困`);
+                                }
+                            } else {
+                                const teleported = this._forceUnstuck(a, b, map);
+                                if (teleported) {
+                                    console.log(`[碰撞脱困] ${a.name} 和 ${b.name} 碰撞死锁${a.collisionStallTimer.toFixed(1)}秒，强制脱困`);
+                                    if (this.addEvent) {
+                                        this.addEvent(`⚠️ ${a.name} 和 ${b.name} 在${a.currentScene}卡住了，强制脱困`);
+                                    }
                                 }
                             }
                         }
@@ -1453,28 +1499,43 @@ const resp = await fetch('http://localhost:8080/api/save-debug-log', {
                         this._forceCrazyEscape(b, map);
                     }
 
-                    // 【修复】如果两个NPC都没在移动且都不在对话/睡觉，给随机推力
+                    // 【修复】如果两个NPC都没在移动且都不在对话/睡觉/吃饭，给随机推力
                     // 避免两个NPC面对面卡死不动
                     if (!a.isMoving && !b.isMoving && a.state !== 'CHATTING' && b.state !== 'CHATTING'
-                        && !a.isSleeping && !b.isSleeping) {
-                        const nudge = TILE * 0.3;
+                        && !a.isSleeping && !b.isSleeping && !a.isEating && !b.isEating) {
+                        // 持有行为锁的NPC大幅减弱推力
+                        const aHasLock = a._currentBehaviorLock;
+                        const bHasLock = b._currentBehaviorLock;
+                        const nudgeScale = (aHasLock || bHasLock) ? 0.1 : 1.0;
+                        const nudge = TILE * 0.3 * nudgeScale;
                         const angle = Math.random() * Math.PI * 2;
                         const nudgeX = Math.cos(angle) * nudge;
                         const nudgeY = Math.sin(angle) * nudge;
                         // 随机推力也要检查墙壁
-                        if (!map || !map.isSolid(b.x + nudgeX + TILE / 2, b.y + nudgeY + TILE / 2)) {
+                        if (!bHasLock && (!map || !map.isSolid(b.x + nudgeX + TILE / 2, b.y + nudgeY + TILE / 2))) {
                             b.x += nudgeX;
                             b.y += nudgeY;
-                        } else if (!map || !map.isSolid(a.x - nudgeX + TILE / 2, a.y - nudgeY + TILE / 2)) {
-                            // b方向推不动，尝试推a
+                        } else if (!aHasLock && (!map || !map.isSolid(a.x - nudgeX + TILE / 2, a.y - nudgeY + TILE / 2))) {
+                            // b方向推不动或b有锁，尝试推a
                             a.x -= nudgeX;
                             a.y -= nudgeY;
                         }
 
-                        // 【增强】两个都静止碰撞超过3秒 → 也强制脱困
+                        // 双方都有行为锁且碰撞>10秒，打印警告日志
+                        if (aHasLock && bHasLock && a.collisionStallTimer > 10) {
+                            console.warn(`[碰撞警告] ${a.name} 和 ${b.name} 双方都有行为锁，无法脱困`);
+                        }
+
+                        // 【增强】两个都静止碰撞超过3秒 → 也强制脱困（但需检查保护状态）
                         if (a.collisionStallTimer > 3.0 && b.collisionStallTimer > 3.0) {
-                            this._forceUnstuck(a, b, map);
-                            console.log(`[碰撞脱困] ${a.name} 和 ${b.name} 双静止死锁，强制脱困`);
+                            const aProtected = a._isBeingTreated || a._currentBehaviorLock;
+                            const bProtected = b._isBeingTreated || b._currentBehaviorLock;
+                            if (aProtected && bProtected) {
+                                // 双方都有保护，不传送
+                            } else {
+                                this._forceUnstuck(a, b, map);
+                                console.log(`[碰撞脱困] ${a.name} 和 ${b.name} 双静止死锁，强制脱困`);
+                            }
                         }
                     }
                 }
@@ -1488,19 +1549,49 @@ const resp = await fetch('http://localhost:8080/api/save-debug-log', {
      * 返回 true 如果成功传送
      */
     _forceUnstuck(a, b, map) {
-        // 选择传送哪个NPC：优先传送路径较短/发疯/静止的那个
+        // 【修复】行为锁保护：正在吃饭/睡觉/治疗的NPC不可被传送
+        const aProtected = a.isEating || a.isSleeping || a._isBeingTreated;
+        const bProtected = b.isEating || b.isSleeping || b._isBeingTreated;
+        const aHasLock = !!a._currentBehaviorLock;
+        const bHasLock = !!b._currentBehaviorLock;
+
+        // 双方都在保护状态（吃饭/睡觉/治疗），拒绝传送
+        if (aProtected && bProtected) {
+            console.log(`[碰撞脱困] ${a.name} 和 ${b.name} 双方都在保护状态，跳过传送`);
+            return false;
+        }
+        // 双方都有行为锁，拒绝传送
+        if (aHasLock && bHasLock) {
+            console.log(`[碰撞脱困] ${a.name} 和 ${b.name} 双方都有行为锁，跳过传送`);
+            return false;
+        }
+
+        // 选择传送哪个NPC：优先传送没有行为锁/没有保护状态的
         let toMove = b;
         let other = a;
-        if (a.isCrazy && !b.isCrazy) { toMove = a; other = b; }
+        // 优先级1：传送没有保护状态的NPC
+        if (aProtected && !bProtected) { toMove = b; other = a; }
+        else if (bProtected && !aProtected) { toMove = a; other = b; }
+        // 优先级2：传送没有行为锁的NPC
+        else if (aHasLock && !bHasLock) { toMove = b; other = a; }
+        else if (bHasLock && !aHasLock) { toMove = a; other = b; }
+        // 优先级3：原有选择逻辑
+        else if (a.isCrazy && !b.isCrazy) { toMove = a; other = b; }
         else if (!a.isMoving && b.isMoving) { toMove = a; other = b; }
         else if (a.currentPath.length < b.currentPath.length) { toMove = a; other = b; }
+
+        // 最终安全检查：如果被选中传送的NPC处于保护状态，拒绝传送
+        if (toMove.isEating || toMove.isSleeping || toMove._isBeingTreated) {
+            console.log(`[碰撞脱困] ${toMove.name} 处于保护状态，拒绝传送`);
+            return false;
+        }
 
         const gx = Math.floor((toMove.x + TILE / 2) / TILE);
         const gy = Math.floor((toMove.y + TILE / 2) / TILE);
 
-        // 搜索半径2~4格内的空位
+        // 搜索半径1~2格内的空位（限制搜索范围避免大范围"闪现"）
         const candidates = [];
-        for (let r = 2; r <= 4; r++) {
+        for (let r = 1; r <= 2; r++) {
             for (let dx = -r; dx <= r; dx++) {
                 for (let dy = -r; dy <= r; dy++) {
                     if (Math.abs(dx) !== r && Math.abs(dy) !== r) continue; // 只检查外圈
@@ -1707,14 +1798,29 @@ const resp = await fetch('http://localhost:8080/api/save-debug-log', {
                 npc.shopVisitorCount = 0;
                 npc.shopLastVisitorTime = null;
                 npc.shopAloneMinutes = 0;
-                npc.hunger = 100; // 新的一天，饱食重置
-                npc.isEating = false;
-                npc._hungerOverride = false;
-                npc._hungerTarget = null;
-                // 新的一天：体力部分恢复（睡了一晚）
-                npc.stamina = Math.min(100, npc.stamina + 30);
-                // 新的一天：San值部分恢复
-                npc.sanity = Math.min(100, npc.sanity + 15);
+                
+                // 【修复】如果NPC正在睡觉，保护睡眠状态，避免属性突变导致起床震荡
+                if (npc.isSleeping) {
+                    npc._dayChangeWhileSleeping = true; // 标记日切换发生在睡眠中
+                    npc._forcedSleep = false;  // 【硬保护】日切换清除强制睡眠标记，新的一天恢复正常日程
+                    npc._forcedSleepTimer = 0;
+                    npc.hunger = Math.max(npc.hunger, 80); // 温和恢复，不强制重置为100
+                    npc.isEating = false;
+                    npc._hungerOverride = false;
+                    npc._hungerTarget = null;
+                    // 睡眠中体力和San值正常恢复
+                    npc.stamina = Math.min(100, npc.stamina + 30);
+                    npc.sanity = Math.min(100, npc.sanity + 15);
+                } else {
+                    npc.hunger = 100; // 新的一天，饱食重置
+                    npc.isEating = false;
+                    npc._hungerOverride = false;
+                    npc._hungerTarget = null;
+                    // 新的一天：体力部分恢复（睡了一晚）
+                    npc.stamina = Math.min(100, npc.stamina + 30);
+                    // 新的一天：San值部分恢复
+                    npc.sanity = Math.min(100, npc.sanity + 15);
+                }
                 // 工作日薪结算（简化：每天结算一次固定收入）
                 if (npc.workplaceName) {
                     npc.savings += 30; // 基础日薪
@@ -1731,7 +1837,21 @@ const resp = await fetch('http://localhost:8080/api/save-debug-log', {
                 const report = this.resourceSystem.generateDayReport(this.dayCount - 1);
                 if (report) {
                     console.log('[Game] 日结算报告:', this.resourceSystem.formatDayReport(report));
+                    // AI模式日志：每日资源报告
+                    if (this.aiModeLogger) {
+                        this.aiModeLogger.log('DAILY_RESOURCE', this.resourceSystem.formatDayReport(report));
+                    }
                 }
+            }
+            // AI模式日志：每日总结（所有NPC属性快照）
+            if (this.aiModeLogger && this.npcs.length > 0) {
+                const aliveNpcs = this.npcs.filter(n => !n.isDead);
+                const lines = aliveNpcs.map(npc => {
+                    const snap = AIModeLogger.npcAttrSnapshot(npc);
+                    return `  ${npc.name} | ${npc.state || '?'}/${npc.stateDesc || '?'} | ${snap} | ${npc.currentScene || '?'}`;
+                });
+                const deadCount = this.npcs.length - aliveNpcs.length;
+                this.aiModeLogger.log('DAY_SUMMARY', `第${this.dayCount}天开始 | 存活${aliveNpcs.length}人 死亡${deadCount}人:\n${lines.join('\n')}`);
             }
             if (this.furnaceSystem && this.furnaceSystem.onDayChange) {
                 this.furnaceSystem.onDayChange(this.dayCount);
@@ -1771,6 +1891,7 @@ const resp = await fetch('http://localhost:8080/api/save-debug-log', {
         if (this.deathSystem) this.deathSystem.update(gameDt);
         if (this.taskSystem) this.taskSystem.update(gameDt);
         if (this.eventSystem) this.eventSystem.update(gameDt);
+        if (this.aiModeLogger) this.aiModeLogger.update(gameDt);
 
         // 【任务5】无线电求救检测：修好无线电 + 第4天时触发救援信号
         if (this._radioRepaired && !this._radioRescueTriggered && this.dayCount >= 4) {
@@ -1837,28 +1958,11 @@ const resp = await fetch('http://localhost:8080/api/save-debug-log', {
     }
 
     _onHourChange(hour) {
-        // 每天早上6点决定当天基础天气
-        if (hour === 6) {
-            const weathers = ['晴天', '晴天', '晴天', '多云', '多云', '小雨', '大雨'];
-            this.weather = weathers[Math.floor(Math.random() * weathers.length)];
+        // 【修复】废掉旧的随机天气系统，统一使用 WeatherSystem 的预设天气
+        // 每小时同步 WeatherSystem 的天气到 this.weather，确保全局一致
+        if (this.weatherSystem) {
+            this.weather = this.weatherSystem.currentWeather;
             this._updateRainIntensity();
-            this.addEvent(`🌤 今日天气：${this.weather}`);
-        }
-        // 天气可能在白天变化
-        if (hour === 12 || hour === 16) {
-            if (Math.random() < 0.3) {
-                const options = this.weather === '晴天' 
-                    ? ['多云', '晴天'] 
-                    : this.weather === '多云'
-                    ? ['晴天', '小雨', '多云']
-                    : ['多云', '小雨', '大雨'];
-                const newWeather = options[Math.floor(Math.random() * options.length)];
-                if (newWeather !== this.weather) {
-                    this.weather = newWeather;
-                    this._updateRainIntensity();
-                    this.addEvent(`🌦 天气变化：${this.weather}`);
-                }
-            }
         }
     }
 
@@ -2055,15 +2159,19 @@ const resp = await fetch('http://localhost:8080/api/save-debug-log', {
             ctx.fillRect(0, 0, this.viewW, this.viewH);
         }
 
-        // 多云/雨天额外加暗
-        if (this.weather === '多云') {
+        // 多云/雨天额外加暗 —— 使用WeatherSystem的天气
+        const wsWeather = this.weatherSystem ? this.weatherSystem.currentWeather : this.weather;
+        if (wsWeather === '多云') {
             ctx.fillStyle = 'rgba(80,80,90,0.1)';
             ctx.fillRect(0, 0, this.viewW, this.viewH);
-        } else if (this.weather === '小雨') {
+        } else if (wsWeather === '小雨') {
             ctx.fillStyle = 'rgba(60,65,80,0.15)';
             ctx.fillRect(0, 0, this.viewW, this.viewH);
-        } else if (this.weather === '大雨') {
+        } else if (wsWeather === '大雨' || wsWeather === '大雪') {
             ctx.fillStyle = 'rgba(40,45,60,0.25)';
+            ctx.fillRect(0, 0, this.viewW, this.viewH);
+        } else if (wsWeather === '极寒暴风雪') {
+            ctx.fillStyle = 'rgba(30,35,50,0.35)';
             ctx.fillRect(0, 0, this.viewW, this.viewH);
         }
     }
@@ -2155,9 +2263,11 @@ const resp = await fetch('http://localhost:8080/api/save-debug-log', {
         const ctx = this.ctx;
         const hours = Math.floor((this.gameTimeSeconds / 3600) % 24);
         const minutes = Math.floor((this.gameTimeSeconds / 60) % 60);
-        const weatherEmoji = { '晴天': '☀️', '多云': '⛅', '小雨': '🌧️', '大雨': '⛈️' };
-        const wEmoji = weatherEmoji[this.weather] || '☀️';
-        const timeStr = `第 ${this.dayCount} 天  ${hours.toString().padStart(2, '0')}:${minutes.toString().padStart(2, '0')}  ${wEmoji} ${this.weather}`;
+        // 【修复】统一使用 WeatherSystem 的天气信息
+        const ws = this.weatherSystem;
+        const wEmoji = ws ? ws.weatherEmoji : '☀️';
+        const wName = ws ? ws.currentWeather : this.weather;
+        const timeStr = `第 ${this.dayCount} 天  ${hours.toString().padStart(2, '0')}:${minutes.toString().padStart(2, '0')}  ${wEmoji} ${wName}`;
 
         // 右下角时间
         ctx.save();
@@ -2260,6 +2370,11 @@ const resp = await fetch('http://localhost:8080/api/save-debug-log', {
             this.reincarnationSystem.savePastLife();
         }
 
+        // 1.5 刷盘AI模式日志并重建
+        if (this.aiModeLogger) {
+            this.aiModeLogger.forceFlush();
+        }
+
         // 2. 清除自动保存的debug log定时器
         if (this._debugLogAutoSaveInterval) {
             clearInterval(this._debugLogAutoSaveInterval);
@@ -2320,6 +2435,10 @@ const resp = await fetch('http://localhost:8080/api/save-debug-log', {
 
         // 7. 重建所有子系统（最干净的重置方式）
         this.weatherSystem = (typeof WeatherSystem !== 'undefined') ? new WeatherSystem(this) : null;
+        // 【修复】重置时同步天气
+        if (this.weatherSystem) {
+            this.weather = this.weatherSystem.currentWeather;
+        }
         this.resourceSystem = (typeof ResourceSystem !== 'undefined') ? new ResourceSystem(this) : null;
         this.furnaceSystem = (typeof FurnaceSystem !== 'undefined') ? new FurnaceSystem(this) : null;
         this.deathSystem = (typeof DeathSystem !== 'undefined') ? new DeathSystem(this) : null;
@@ -2330,6 +2449,9 @@ const resp = await fetch('http://localhost:8080/api/save-debug-log', {
         if (this.reincarnationSystem) {
             this.reincarnationSystem.advanceLife();
         }
+
+        // 8.5 重建AI模式日志系统（新会话文件）
+        this.aiModeLogger = (this.isAgentMode && typeof AIModeLogger !== 'undefined') ? new AIModeLogger(this) : null;
 
         // 9. 重新初始化NPC（从NPC_CONFIGS重新创建，但会在之后应用轮回加成）
         this.npcs = [];
@@ -2427,10 +2549,12 @@ const resp = await fetch('http://localhost:8080/api/save-debug-log', {
     _updateReincarnationUI() {
         const el = document.getElementById('surv-reincarnation');
         if (!el) return;
-        if (this.reincarnationSystem && this.reincarnationSystem.getLifeNumber() > 1) {
+        // 轮回模式下始终显示当前世数（包括第1世），agent/debug模式隐藏
+        if (this.mode === 'reincarnation' && this.reincarnationSystem) {
             el.style.display = '';
             const valEl = document.getElementById('surv-reincarnation-val');
-            if (valEl) valEl.textContent = `第${this.reincarnationSystem.getLifeNumber()}世`;
+            const lifeNum = this.reincarnationSystem.getLifeNumber();
+            if (valEl) valEl.textContent = `第${lifeNum}世`;
         } else {
             el.style.display = 'none';
         }
@@ -2602,6 +2726,20 @@ window.addEventListener('load', () => {
     const btnDebug = document.getElementById('btn-mode-debug');
     const btnReincarnation = document.getElementById('btn-mode-reincarnation');
 
+    // --- 检测并显示轮回历史状态 ---
+    try {
+        const lifeNumRaw = localStorage.getItem('gospel_reincarnation_life_num');
+        const lifeNum = lifeNumRaw ? parseInt(lifeNumRaw, 10) : 0;
+        if (lifeNum > 1) {
+            const hintEl = document.getElementById('reincarnation-status-hint');
+            const hintText = document.getElementById('reincarnation-hint-text');
+            if (hintEl && hintText) {
+                hintEl.style.display = '';
+                hintText.textContent = `🔄 检测到轮回存档：当前第${lifeNum}世`;
+            }
+        }
+    } catch (e) { /* ignore */ }
+
     // --- 模型选择交互 ---
     const modelOptions = document.querySelectorAll('.model-option');
     modelOptions.forEach(opt => {
@@ -2638,6 +2776,19 @@ window.addEventListener('load', () => {
         if (success) {
             // 短暂延迟让用户看到成功提示
             await new Promise(r => setTimeout(r, 600));
+
+            // 轮回模式：如果用户勾选了"从第1世重新开始"，先清除轮回数据
+            if (mode === 'reincarnation') {
+                const chkReset = document.getElementById('chk-reset-reincarnation');
+                if (chkReset && chkReset.checked) {
+                    try {
+                        localStorage.removeItem('gospel_reincarnation');
+                        localStorage.removeItem('gospel_reincarnation_life_num');
+                        console.log('[启动] 用户选择从第1世重新开始，轮回数据已清除');
+                    } catch (e) { /* ignore */ }
+                }
+            }
+
             overlay.style.display = 'none';
             document.getElementById('app-layout').style.display = 'flex';
             window.game = new Game(mode);
