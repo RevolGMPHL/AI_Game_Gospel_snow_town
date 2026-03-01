@@ -422,18 +422,32 @@ class TaskSystem {
             this._teamEfficiencyBonus = NPC_SPECIALTIES['wang_teacher'].teamBonus;
         }
 
-        switch (day) {
-            case 1: this._generateDay1Tasks(rs, fs, aliveNpcs); break;
-            case 2: this._generateDay2Tasks(rs, fs, aliveNpcs); break;
-            case 3: this._generateDay3Tasks(rs, fs, aliveNpcs); break;
-            case 4: this._generateDay4Tasks(rs, fs, aliveNpcs); break;
+        // 【智能分工系统】优先使用workPlan，否则走硬编码路径
+        let usedWorkPlan = false;
+        if (this.game.reincarnationSystem) {
+            const holder = this.game.reincarnationSystem.getWorkPlanHolder();
+            if (holder && holder.workPlan && holder.workPlan.dayPlans && holder.workPlan.dayPlans[day]) {
+                this._generateTasksFromWorkPlan(holder.workPlan, day, rs, fs, aliveNpcs);
+                usedWorkPlan = true;
+                console.log(`[TaskSystem] 第${day}天使用workPlan生成任务(策略:${holder.workPlan.strategy})`);
+            }
+        }
+        if (!usedWorkPlan) {
+            switch (day) {
+                case 1: this._generateDay1Tasks(rs, fs, aliveNpcs); break;
+                case 2: this._generateDay2Tasks(rs, fs, aliveNpcs); break;
+                case 3: this._generateDay3Tasks(rs, fs, aliveNpcs); break;
+                case 4: this._generateDay4Tasks(rs, fs, aliveNpcs); break;
+            }
         }
 
         // 分配任务给NPC
         this._assignTasks(aliveNpcs);
 
-        // 【轮回系统】基于前世经验优化任务
-        this._applyReincarnationTaskBoost(day);
+        // 【轮回系统】未使用workPlan时才走旧的优化路径
+        if (!usedWorkPlan) {
+            this._applyReincarnationTaskBoost(day);
+        }
 
         // 广播任务清单
         if (this.game.addEvent) {
@@ -588,6 +602,166 @@ class TaskSystem {
         this._addTask(TASK_TYPES.BOOST_MORALE, 1, 'urgent', 'ling_yue');
         // 制药+辅助 — 清璇
         this._addTask(TASK_TYPES.CRAFT_MEDICINE, 1, 'high', 'qing_xuan');
+    }
+
+    // ============ 【智能分工系统】从workPlan生成任务 ============
+
+    /** 根据workPlan的分工方案生成当天任务 */
+    _generateTasksFromWorkPlan(workPlan, day, rs, fs, aliveNpcs) {
+        const dayPlan = workPlan.dayPlans[day];
+        if (!dayPlan || dayPlan.length === 0) return;
+
+        const aliveIds = new Set(aliveNpcs.map(n => n.id));
+
+        // 根据workPlan中每个NPC的分配生成任务
+        for (const assignment of dayPlan) {
+            const npcId = assignment.npcId;
+            // 如果该NPC已死亡，跳过（后面由reassign处理）
+            if (!aliveIds.has(npcId)) continue;
+
+            const taskType = assignment.task;
+            if (!TASK_DETAILS[taskType]) continue;
+
+            // 确定任务目标量
+            let target = assignment.target || 1;
+            const detail = TASK_DETAILS[taskType];
+            if (detail && detail.resourceType && target <= 1) {
+                target = this._calcResourceTarget(taskType, rs, fs, day);
+            }
+
+            // 确定优先级
+            let priority = assignment.priority || 'high';
+            if (day === 4) priority = 'urgent';
+
+            this._addTask(taskType, target, priority, npcId);
+        }
+
+        // 为已死亡NPC的任务重分配给存活NPC
+        const deadAssignments = dayPlan.filter(a => !aliveIds.has(a.npcId));
+        for (const deadA of deadAssignments) {
+            const taskType = deadA.task;
+            if (!TASK_DETAILS[taskType]) continue;
+
+            const target = deadA.target || this._calcResourceTarget(taskType, rs, fs, day);
+            const bestNpc = this._findBestNpcForTask(taskType, aliveNpcs);
+            if (bestNpc) {
+                this._addTask(taskType, target, 'high', bestNpc.id);
+                console.log(`[TaskSystem-WorkPlan] 死者${deadA.npcId}的任务${taskType}重分配给${bestNpc.name}`);
+            }
+        }
+    }
+
+    /** 根据任务类型和当前资源计算合理的目标量 */
+    _calcResourceTarget(taskType, rs, fs, day) {
+        switch (taskType) {
+            case TASK_TYPES.COLLECT_WOOD: {
+                if (!rs) return 50;
+                const needed = day === 1 ? 80 : day === 3 ? 60 : 30;
+                return Math.max(10, needed - Math.round(rs.woodFuel * 0.3));
+            }
+            case TASK_TYPES.COLLECT_FOOD: {
+                if (!rs) return 40;
+                const needed = day === 1 ? 50 : 30;
+                return Math.max(10, needed - Math.round(rs.food * 0.3));
+            }
+            case TASK_TYPES.COLLECT_MATERIAL: {
+                if (!rs) return 50;
+                return Math.max(10, 50 - Math.round(rs.material * 0.5));
+            }
+            case TASK_TYPES.MAINTAIN_POWER: {
+                if (!rs) return 30;
+                return Math.max(10, 30 - Math.round(rs.power * 0.2));
+            }
+            default: return 1;
+        }
+    }
+
+    /** 为特定任务类型找到最佳NPC（按专长匹配+体力排序） */
+    _findBestNpcForTask(taskType, aliveNpcs) {
+        const urgentAssignedNpcIds = new Set(
+            this.dailyTasks.filter(t => t.priority === 'urgent' && t.assignedNpcId)
+                .map(t => t.assignedNpcId)
+        );
+
+        const candidates = aliveNpcs.filter(n =>
+            !n.isDead && !urgentAssignedNpcIds.has(n.id)
+        );
+
+        if (candidates.length === 0) return aliveNpcs.find(n => !n.isDead) || null;
+
+        candidates.sort((a, b) => {
+            const specA = NPC_SPECIALTIES[a.id];
+            const specB = NPC_SPECIALTIES[b.id];
+            const multA = (specA && specA.bonuses && specA.bonuses[taskType]) || 1.0;
+            const multB = (specB && specB.bonuses && specB.bonuses[taskType]) || 1.0;
+            if (multA !== multB) return multB - multA;
+            return b.stamina - a.stamina;
+        });
+
+        return candidates[0];
+    }
+
+    // ============ 【任务8】动态任务重分配 ============
+
+    /** NPC死亡时重分配其未完成任务 */
+    reassignDeadNpcTasks(deadNpcId) {
+        const aliveNpcs = this.game.npcs.filter(n => !n.isDead);
+        if (aliveNpcs.length === 0) return;
+
+        const deadTasks = this.dailyTasks.filter(
+            t => t.assignedNpcId === deadNpcId && t.status !== 'completed'
+        );
+        if (deadTasks.length === 0) return;
+
+        for (const task of deadTasks) {
+            task.status = 'failed';
+            const remaining = task.target - task.progress;
+            if (remaining <= 0) continue;
+
+            const bestNpc = this._findBestNpcForTask(task.type, aliveNpcs);
+            if (bestNpc) {
+                const newTaskId = this._addTask(task.type, Math.ceil(remaining), task.priority, bestNpc.id);
+                this.npcAssignments[bestNpc.id] = newTaskId;
+
+                if (this.game.addEvent) {
+                    const nameMap = { zhao_chef: '赵铁柱', lu_chen: '陆辰', li_shen: '李婶', wang_teacher: '王策', old_qian: '老钱', su_doctor: '苏岩', ling_yue: '凌玥', qing_xuan: '清璇' };
+                    this.game.addEvent(`🔄 ${nameMap[deadNpcId] || deadNpcId}的未完成任务「${task.name}」已转交给${bestNpc.name}`);
+                }
+                console.log(`[TaskSystem] 死者${deadNpcId}的任务${task.name}重分配给${bestNpc.name}`);
+            }
+        }
+
+        delete this.npcAssignments[deadNpcId];
+        delete this.npcTaskState[deadNpcId];
+    }
+
+    /** 天气变化时将户外NPC任务转为室内 */
+    onWeatherEmergency(weatherType) {
+        if (weatherType !== 'blizzard') return;
+
+        const aliveNpcs = this.game.npcs.filter(n => !n.isDead);
+        for (const task of this.dailyTasks) {
+            if (task.status === 'completed' || !task.isOutdoor) continue;
+
+            const npc = aliveNpcs.find(n => n.id === task.assignedNpcId);
+            if (!npc) continue;
+
+            task.status = 'failed';
+            const newTaskId = this._addTask(TASK_TYPES.MAINTAIN_FURNACE, 1, 'urgent', npc.id);
+            this.npcAssignments[npc.id] = newTaskId;
+
+            if (this.game.addEvent) {
+                this.game.addEvent(`🌨️ 暴风雪！${npc.name}的户外任务「${task.name}」已取消，转为室内维护暖炉`);
+            }
+        }
+
+        // 更新workPlan摘要
+        if (this.game.reincarnationSystem) {
+            const holder = this.game.reincarnationSystem.getWorkPlanHolder();
+            if (holder && holder.workPlan) {
+                holder.workPlan.workPlanSummary += '(暴风雪:户外→室内)';
+            }
+        }
     }
 
     /** 添加任务到清单 */
@@ -795,7 +969,10 @@ class TaskSystem {
         // 资源产出型任务
         const detail = TASK_DETAILS[task.type];
         if (detail && detail.resourceType && detail.baseYield > 0) {
-            const yieldPerSecond = (detail.baseYield / detail.baseDuration) * efficiency;
+            let yieldPerSecond = (detail.baseYield / detail.baseDuration) * efficiency;
+            // 【难度系统】采集效率乘以难度倍率
+            const _diffGatherMult = this.game.getDifficultyMult ? this.game.getDifficultyMult('gatherEfficiencyMult') : 1.0;
+            yieldPerSecond *= _diffGatherMult;
             const produced = yieldPerSecond * dt;
 
             // 第2天户外冒险加成
@@ -938,7 +1115,10 @@ class TaskSystem {
                 const rs = this.game.resourceSystem;
                 if (rs) {
                     const detail = TASK_DETAILS[task.type];
-                    const yieldPerSecond = (detail.baseYield / detail.baseDuration) * efficiency;
+                    let yieldPerSecond = (detail.baseYield / detail.baseDuration) * efficiency;
+                    // 【难度系统】采集效率乘以难度倍率
+                    const _diffGatherMult2 = this.game.getDifficultyMult ? this.game.getDifficultyMult('gatherEfficiencyMult') : 1.0;
+                    yieldPerSecond *= _diffGatherMult2;
                     rs.addResource('power', yieldPerSecond * dt);
                 }
                 break;
@@ -1246,7 +1426,9 @@ class TaskSystem {
         }
 
         // 实际产出 = 基础产出/小时 × 专长倍率 × 体力效率 × 天气惩罚 × 任务倍率 / 3600秒
-        const actualRatePerSec = (baseRate * specialtyMult * staminaEff * weatherPenalty * taskMult) / 3600;
+        // 【难度系统】采集效率乘以难度倍率
+        const _diffGatherMult3 = this.game.getDifficultyMult ? this.game.getDifficultyMult('gatherEfficiencyMult') : 1.0;
+        const actualRatePerSec = (baseRate * specialtyMult * staminaEff * weatherPenalty * taskMult * _diffGatherMult3) / 3600;
         const produced = actualRatePerSec * dt;
 
         if (produced <= 0) return;

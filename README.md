@@ -234,8 +234,7 @@ Detailed design documents are available in the `guide/` directory:
 
 ## 🌟 Inspired By
 
-- 🎮 [The Long Dark](https://www.hinterlandgames.com/the-long-dark/) — Survival atmosphere & resource management
-- 🏰 [Dwarf Fortress](http://www.bay12games.com/dwarves/) — Emergent storytelling through simulation
+
 - 🤖 [Stanford Generative Agents](https://github.com/joonspk-research/generative_agents) — LLM-powered autonomous agents
 - 🌾 [Stardew Valley](https://www.stardewvalley.net/) — Pixel art aesthetic & NPC relationships
 - 🎵 [Frostpunk](https://www.frostpunkgame.com/) — Frozen city survival & moral dilemmas

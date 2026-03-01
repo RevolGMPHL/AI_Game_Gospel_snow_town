@@ -4,6 +4,207 @@
 
 ---
 
+## v2.5 — 全员入睡跳夜机制 (2026-03-01)
+
+### 🌙 新增：全员入睡→快进到早6点（game.js `_checkNightSkip`）
+
+- **问题**：设计上约定"所有人睡着后跳到次日早6点"，但该逻辑从未被实现过，NPC入睡后玩家需要干等真实时间经过漫长夜晚。
+- **实现方案**：
+  - 在 `update()` 主循环中 NPC 更新前新增 `_checkNightSkip()` 检测
+  - **触发条件**：所有存活NPC的 `isSleeping === true` 且当前游戏时间在 22:00~05:59
+  - **跳过行为**：直接将 `gameTimeSeconds` 设为 `06:00`（21600秒）
+  - **每天仅一次**：`_nightSkipDone` 标志防止重复跳，日切换时重置
+  - **跨午夜处理**：22:00后跳过需正确触发日切换（dayCount++、子系统通知、NPC属性保护）
+  - **NPC睡眠恢复补算**：体力+8/h、San+3/h、健康+1/h、体温回升+0.5°C/h
+  - **资源消耗补算**：通过 `resourceSystem._tickConsumption(skipSeconds)` 补扣木柴和电力
+  - **小时变化补触发**：跳过的每个小时都调用 `_onHourChange()` 确保天气同步
+  - **UI通知**：`🌙💤 全员入睡，夜间快进到早上 06:00`
+  - **AI模式日志**：记录跳夜事件和跳过时长
+
+---
+
+## v2.4 — P0紧急修复：采集产出为0 + 死亡NPC幻觉安抚 (2026-02-26)
+
+### 🐛 Bug修复
+
+- **采集产出为0**：NPC到达任务目标（伐木场/冰湖等）但实际资源产出接近0。
+  - **根因**：`_updateActionEffect()` 用 `this.stateDesc` 匹配 `ACTION_EFFECT_MAP` 关键词，但 LLM `_actionDecision()` 返回的 `action.reason`（如"前往伐木场协助采集"）会覆盖 `stateDesc`，导致原本的日程关键词（如"砍柴"、"伐木"）丢失，匹配失败。
+  - **修复**：`_updateActionEffect()` 现在同时匹配 `stateDesc` 和日程原始 `scheduleTemplate[schedIdx].desc`，两者任一命中即可触发效果。
+
+- **LLM安抚已死角色**：存活NPC（如王策、清璇）反复决策"去安抚陆辰/凌玥"——但这些人已经死亡，浪费大量行动时间。
+  - **根因**：`allNPCStatus`（行动决策prompt）、`sameSceneNPCs`（思考prompt）、`_getNearbyNPCs()`（附近感知）、`friendsInCrisis`（挚友告警）这4处NPC列表构建均未过滤 `isDead` 的NPC。
+  - **修复**：在以上4处全部添加 `!n.isDead` 过滤条件，确保死亡NPC不再出现在任何LLM prompt中。
+
+### 📝 代码改动
+- npc.js: `_updateActionEffect()` 新增 `scheduleDesc` 变量 + 双路径关键词匹配（stateDesc ∪ scheduleDesc）
+- npc.js: `_actionDecision()` 中 `allNPCStatus` 添加 `!n.isDead` 过滤
+- npc.js: `_actionDecision()` 中 `friendsInCrisis` 添加 `!n.isDead` 过滤
+- npc.js: `think()` 中 `sameSceneNPCs` 添加 `!n.isDead` 过滤
+- npc.js: `_getNearbyNPCs()` 添加 `npc.isDead` 跳过逻辑
+
+---
+
+## v2.3 — 超级智能AI分工协调系统 + 决策硬性拦截 (2026-02-25)
+
+### 🧠 智能分工系统（reincarnation-system.js）
+- **`generateWorkPlan()`**：基于前世轮回记忆自动生成本世分工方案，精确到「谁-做什么-多长时间-目标量-原因」
+  - 分析前世数据：resourceSnapshot、deathRecords、npcFinalStates、unfinishedTasks、secondFurnaceBuilt
+  - 输出结构化 `lifePlan` 对象：每天(day1-day4) → 每个NPC → { npcId, task, targetLocation, hours, target, reason }
+  - 第1世无记忆：fallback 到硬编码默认方案
+  - 前世全员存活：复用上世方案微调
+  - 存活人数下降：生成更激进的调整策略
+- **`_generateDeepLessons()`**：前世教训深度分析（替代原有粗略的 `generateLessons()`）
+  - 资源比例分析：检测采集「偏科」（如食物采了200但木柴只采了30）
+  - 人力分配分析：推断谁的时间被「浪费」
+  - 时序分析：按死亡时间判断关键时间节点
+  - 因果链推导：具体到人员调整建议
+  - 输出分层教训：`{ strategic: [...], tactical: [...], execution: [...] }`
+- **`analyzeMultiLifePatterns()`**：多世学习演进（pastLives≥2时启用）
+  - 成功策略库：提取资源平衡好/存活人数多的分配模式
+  - 失败模式库：识别反复出现的失败模式
+  - 资源趋势分析：多世间各资源采集量/消耗量的变化趋势
+
+### 👴 老钱指挥中心（game.js + death-system.js）
+- **`_initWorkPlan()`**：Game构造函数和 `reincarnate()` 中调用，生成workPlan并存储到老钱
+- **`getWorkPlanHolder()`**：返回当前workPlan持有者（老钱→王策→李婶→凌玥继任链）
+- **`_handleWorkPlanTransfer()`**：NPC死亡时自动将workPlan转移给下一个继任者
+- **`getWorkPlanSummaryForNpc(npcId)`**：返回给特定NPC看的安排摘要（本人任务★标记+全镇概览）
+- **`getLessonsForNpc(npcId)`**：返回与特定NPC相关的前世教训
+
+### 📋 任务系统增强（task-system.js）
+- **`_generateTasksFromWorkPlan()`**：根据workPlan分工方案生成当天任务，替代硬编码
+- **`_calcResourceTarget()`**：根据当前资源和天数动态计算目标量
+- **`_findBestNpcForTask()`**：按专长匹配+体力排序找最佳NPC
+- **`reassignDeadNpcTasks()`**：NPC死亡时按专长重分配未完成任务
+- **`onWeatherEmergency()`**：暴风雪天气时自动将户外任务转为室内维护暖炉
+
+### 🤖 NPC决策Prompt增强（npc.js）
+- **`think()` prompt**：注入workPlan安排摘要+前世教训，新增规则「🎯必须严格执行工作安排表中的分工」
+- **`_actionDecision()` prompt**：注入全镇分工总览+相关教训+强约束规则「安排表优先，紧急情况才能偏离」
+- **5个硬性约束拦截器**：
+  - 【拦截1】暴风雪天户外目标 → 强制stay
+  - 【拦截2】暴风雪中在户外 → 强制回室内
+  - 【拦截3】体温<33°C → 强制回暖炉
+  - 【拦截4】健康<10 → 强制去医院
+  - 【拦截5】有安排却wander → 强制work
+
+### 🐛 Bug修复
+- **eventLog未初始化导致crash**：`_initWorkPlan()` 在构造函数中被调用时 `this.eventLog` 尚未初始化，导致 `addEvent()` 调用时 `this.eventLog.unshift()` 报错 `Cannot read properties of undefined`。修复：workPlan事件延迟到 `eventLog` 初始化后补发
+
+### 📝 代码改动
+- reincarnation-system.js: 新增 `generateWorkPlan()` + `_generateDeepLessons()` + `analyzeMultiLifePatterns()` + `getWorkPlanHolder()` + `getWorkPlanSummaryForNpc()` + `getLessonsForNpc()`
+- task-system.js: 新增 `_generateTasksFromWorkPlan()` + `_calcResourceTarget()` + `_findBestNpcForTask()` + `reassignDeadNpcTasks()` + `onWeatherEmergency()`
+- game.js: 新增 `_initWorkPlan()` 方法，构造函数和 `reincarnate()` 中调用
+- death-system.js: 新增 `_handleWorkPlanTransfer()`，NPC死亡时workPlan转移+任务重分配
+- npc.js: `think()` 和 `_actionDecision()` prompt注入分工安排和教训 + 5个硬性约束拦截器
+- game.js: 修复 `_initWorkPlan` 中 `addEvent` 调用时 `eventLog` 未初始化的bug
+
+---
+
+## v2.1 — NPC行动效果数值化 + 动态气泡 + 急救包重构 + 苏岩日程优化 (2026-02-23)
+
+### 🎯 NPC行动效果数值化系统（npc.js）
+- **ACTION_EFFECT_MAP**：新增行动描述关键词→系统效果的映射表（15条规则），支持10种效果类型
+  - produce_resource（木柴10/h、食物8/h、建材5/h、电力8/h）
+  - build_progress（暖炉扩建1%/h）
+  - craft_medkit（急救包0.5个/h）
+  - repair_radio（无线电修理1%/h）
+  - reduce_waste（食物浪费-20%）
+  - medical_heal（医疗站内治疗）
+  - patrol_bonus（巡逻警戒San恢复）
+  - morale_boost（安抚鼓舞San恢复）
+  - furnace_maintain（暖炉维护保温）
+- **_updateActionEffect()**：每个update周期自动匹配当前NPC行为描述中的关键词，触发对应系统效果
+- **_getSpecialtyMultiplier()**：专长加成倍率计算，有对应专长的NPC获得×1.5倍率加成
+- **动态数值气泡**：行动气泡实时显示当前NPC的实际产出速率（含体力效率×专长倍率×电力加成）
+
+### 🔧 专长名映射修复（7处：npc.js）
+- `chop` → `chopping`（赵铁柱砍柴专长）
+- `gather_food` → `gathering_food`（李婶采集食物专长）
+- `repair` → `generator_repair`（老钱发电机维修专长）
+- `build` → `gathering_material`（赵铁柱建材采集专长）
+- `medkit` → `herbal_craft`（苏岩草药制作专长）
+- `radio` → `radio_repair`（老钱无线电修理专长）
+- `medical` → `medical_treatment`（苏岩医疗专长）
+- **新增3个缺失效果类型分支**：morale_boost / furnace_maintain / reduce_waste
+
+### 📊 数值修正（npc.js）
+- morale_boost San恢复速率：0.10 → 0.003/游戏秒（≈10.8/h），避免San瞬间拉满
+- patrol_bonus San恢复速率：0.02 → 0.005/游戏秒（≈18/h），合理化巡逻加成
+
+### 🛠️ 空转行为修复（7处：npc.js）
+- 补充王策22-24点desc关键词（匹配repair_radio）
+- 补充老钱17-18点desc关键词（匹配furnace_maintain）
+- 补充苏岩17-18点desc关键词（匹配medical_heal）
+- 补充苏岩22-24点desc关键词（匹配craft_medkit）
+- 补充陆辰22-24点desc关键词（匹配patrol_bonus）
+- 补充凌玥22-24点desc关键词（匹配morale_boost）
+- 补充清璇13-15点desc关键词（匹配reduce_waste）
+
+### 💊 急救包系统重构（resource-system.js + npc.js + game.js + index.html + style.css）
+- **独立消耗品物资**：急救包作为独立资源类型，数量显示在资源面板
+- **全局自动检查**：任何NPC健康<50时自动消耗1个急救包恢复健康
+- **苏岩专长加成**：苏岩medical_treatment专长翻倍急救包恢复量
+- **资源面板新增**：index.html + style.css新增急救包🩹图标和数量显示
+
+### 👨‍⚕️ 苏岩日程优化（npc.js）
+- **修改前**：medical_heal 11小时（大部分空转）+ craft_medkit 2小时
+- **修改后**：medical_heal 5小时（更精准）+ produce_resource(food) 4小时（+32食物/天）+ craft_medkit 2小时 + morale_boost 2小时
+- 具体日程调整：
+  - 8-10：医疗站坐诊（保留medical_heal）
+  - 10-12：冰湖采集食物（新增produce_resource）
+  - 13-15：冰湖采集食物（新增produce_resource）
+  - 15-17：医疗站坐诊（保留medical_heal）
+  - 19-21：暖炉广场巡查安抚（medical_heal + morale_boost）
+  - 21-22：医疗站值班（保留medical_heal）
+  - 22-24：医疗站整理药品（保留craft_medkit）
+
+### 📝 代码改动
+- npc.js: 新增ACTION_EFFECT_MAP（15条映射规则）+ _updateActionEffect() + _getSpecialtyMultiplier()
+- npc.js: 7处专长名映射修复 + 3个缺失效果类型分支
+- npc.js: morale_boost/patrol_bonus数值修正
+- npc.js: 7处NPC日程desc关键词补充（消除空转）
+- npc.js: 苏岩schedule重构（13条日程条目）
+- resource-system.js: 急救包独立资源管理 + 全局自动检查
+- game.js: 急救包系统初始化和update集成
+- index.html: 资源面板新增急救包显示区域
+- style.css: 急救包图标样式
+
+---
+
+## v2.2 — 难度选择UI优化：直接嵌入开始界面 + 轮回锁定 (2026-02-24)
+
+### 🎮 难度选择器UI重构（index.html + style.css + game.js）
+- **直接嵌入开始界面**：难度选择器从隐藏弹出改为始终显示在模式按钮下方，与"选择AI模型"区域风格一致
+- **去掉"开始轮回"确认按钮**：选好难度后直接点"轮回模式"按钮即可启动游戏，减少一步操作
+- **难度提示文案**：新增"难度仅在轮回模式生效 · 轮回中途无法切换，需勾选「从第1世重新开始」才能重选"提示
+- **轮回中难度锁定**：有存档时难度卡片变为半透明不可点击状态，当前难度标注🔒图标
+- **勾选重置解锁**：勾选"从第1世重新开始"后解锁所有难度卡片，取消勾选则重新锁定
+- **非轮回模式强制简单**：AI观察模式和Debug模式启动时自动使用简单难度
+
+### 🎨 视觉优化（style.css）
+- 难度卡片布局从 `grid 3列` 改为 `flex-wrap` 自适应排列，每张卡片固定宽度130px
+- hover效果增强：`scale(1.05)` + 紫色发光
+- 选中态增强：双层发光 `box-shadow`
+- 新增 `.locked` 锁定态（半透明+灰度+禁止点击）和 `.current-locked` 当前难度高亮态
+- 移除 `.difficulty-confirm-btn` 相关所有样式
+- 新增 `.difficulty-locked-text` 锁定提示文字样式
+
+### 🧹 代码清理（game.js）
+- 移除 `difficultyConfirmBtn`、`difficultyLockedHint`、`difficultyLockedLabel` DOM引用
+- 新增 `lockDifficultyCards(currentKey)` / `unlockDifficultyCards()` 辅助函数
+- 页面加载时根据 `localStorage` 轮回存档状态自动锁定/解锁难度卡片
+- 轮回模式按钮点击事件简化：有存档直接启动，新轮回保存选中难度后启动
+- "从第1世重新开始"勾选事件：勾选解锁卡片、取消勾选重新锁定
+- `startGame()` 函数内新增非轮回模式强制 `setDifficulty('easy')`
+
+### 📝 代码改动
+- index.html: 移除 `#difficulty-selector` 的 `display:none`，移除确认按钮，移除独立的 `#difficulty-locked-hint`，新增内部锁定提示和难度说明文字
+- style.css: `.difficulty-options` 改 flex-wrap，`.difficulty-option` 加固定宽度，新增 locked/current-locked/hover/选中态样式，移除确认按钮样式
+- game.js: 重写难度选择器初始化（移除确认按钮引用+添加锁定辅助函数+存档检测+勾选事件+非轮回强制简单）
+
+---
+
 ## v2.0 — 全面系统升级：健康死亡链路 + 物资平衡 + 暖炉实质化 + UI优化 (2026-02-21)
 
 ### 🔄 重构：健康→死亡链路（death-system.js + npc.js）
@@ -478,7 +679,7 @@ AI轮询加速3倍、丰富晚间社交活动、睡眠安全机制。
 
 ---
 
-## 当前已实现功能 Checklist（更新至 v1.5）
+## 当前已实现功能 Checklist（更新至 v2.3）
 
 ### Phase 1: 🗺️ 地图骨架 + 基础移动 ✅
 ### Phase 2: 🤖 NPC 系统 + AI 驱动 ✅
@@ -486,6 +687,10 @@ AI轮询加速3倍、丰富晚间社交活动、睡眠安全机制。
 ### Phase 4: 🎨 美化 + 细节 🔧 进行中
 ### Phase 5: 🧠 奖惩行为驱动 + 本地LLM ✅
 ### Phase 6: 🗣️ 对话深度修复 + 关系上下文 ✅
+### Phase 7: ⚔️ 末日生存系统 + 健康死亡链路 ✅
+### Phase 8: 🎯 行动效果数值化 + 急救包重构 ✅
+### Phase 9: ⚔️ 难度系统 + UI优化 ✅
+### Phase 10: 🧠 智能分工协调系统 ✅
 
 - [x] 8 个 NPC + 固定日程 + 天气动态调整
 - [x] AI 决策 + 轮询加速
@@ -518,6 +723,42 @@ AI轮询加速3倍、丰富晚间社交活动、睡眠安全机制。
 - [x] 对话关系上下文：好感度描述 + 冷淡期状态 + 近期对话记忆注入prompt
 - [x] 调试日志服务端化：对话循环关键状态 _logDebug 持久化
 - [x] 模型升级：Qwen3-4B → Qwen3-14B Q8（对话质量大幅提升）
+- [x] 健康→死亡链路：健康归零致死 + 饥饿加速 + 严重失温 + 濒死状态 + 死亡通知
+- [x] 物资采集速率重平衡：木柴8/h、食物5/h、电力12/h、建材6/h + 体力效率 + 天气效率
+- [x] 物资消耗受天气影响：4天天气周期×不同消耗乘数
+- [x] 暖炉建设机制实质化：初始1座 + 建造进度 + 资源不足暂停 + 工人效率
+- [x] 任务目标实质化：无线电修理进度 + 急救包制作 + 陷阱布置 + 食物分配 + 御寒准备
+- [x] NPC行为合理性：资源紧急禁止聊天 + urgent任务打断 + 自动分配空闲NPC
+- [x] 轮回系统修复：独立世数存储 + 正确递增 + 旧存档兼容
+- [x] 发呆兜底 + 起床冻死修复：极端天气日程替换 + 传送/出门天气保护
+- [x] 第3天日程规划：第4天准备清单 + 动态优先级 + 增派人力 + 日结算评估
+- [x] ACTION_EFFECT_MAP行动效果数值化：15条映射规则 + 10种效果类型
+- [x] _updateActionEffect自动匹配：每update周期匹配行为关键词→触发系统效果
+- [x] _getSpecialtyMultiplier专长加成：有对应专长×1.5倍率
+- [x] 动态数值气泡：实时显示产出速率（体力效率×专长倍率×电力加成）
+- [x] 专长名映射修复：7处错误专长名 + 3个缺失效果类型分支
+- [x] 数值修正：morale_boost 0.003/s, patrol_bonus 0.005/s
+- [x] 7处空转行为修复：补充NPC日程desc关键词匹配
+- [x] 急救包系统重构：独立消耗品 + 全局自动检查 + 资源面板显示
+- [x] 苏岩日程优化：11h坐诊→5h坐诊+4h采集食物+2h巡查安抚
+- [x] 难度系统（difficulty-config.js）：6个等级（简单→地狱）完整参数表
+- [x] 难度选择器UI重构：直接嵌入开始界面 + 轮回中锁定 + 勾选重置解锁
+- [x] 非轮回模式强制简单难度：AI观察/Debug模式启动时自动setDifficulty('easy')
+- [x] 智能分工系统：generateWorkPlan()基于前世轮回记忆自动生成最优分工方案（精确到人/任务/目标量/原因）
+- [x] 前世教训深度分析：_generateDeepLessons()分层教训（战略/战术/执行）+ 资源比例/人力/时序/因果链分析
+- [x] 多世学习演进：analyzeMultiLifePatterns()识别成功策略模式和反复失败模式
+- [x] 老钱指挥中心：workPlan存储在老钱身上 + 死亡时自动转移给继任者（王策→李婶→凌玥）
+- [x] workPlan驱动任务生成：_generateTasksFromWorkPlan()替代硬编码任务分配
+- [x] NPC死亡任务重分配：reassignDeadNpcTasks()按专长匹配重分配未完成任务
+- [x] 暴风雪天气应急：onWeatherEmergency()自动将户外任务转为室内维护暖炉
+- [x] think/action prompt增强：注入workPlan安排摘要+前世教训+强约束「安排表优先」
+- [x] 5个硬性决策拦截器：暴风雪户外→stay、体温<33→回暖炉、健康<10→去医院、有安排却wander→work
+- [x] Bug修复：eventLog未初始化导致_initWorkPlan中addEvent crash
+- [x] 🔴 ~~采集产出量修复~~：v2.4修复 — `_updateActionEffect()` 双路径关键词匹配（stateDesc ∪ scheduleDesc）
+- [x] 🔴 ~~死亡NPC从prompt过滤~~：v2.4修复 — allNPCStatus/sameSceneNPCs/_getNearbyNPCs/friendsInCrisis 全部添加 isDead 过滤
+- [ ] 🟡 San值崩溃速度调优：第2天清晨3小时内5人精神崩溃致死，户外寒冷+死亡惩罚+San<30恶性循环三者叠加形成不可逆的"死亡螺旋"
+- [ ] 🟡 食物消耗异常排查：第1天实际消耗64单位 vs 设计预期24单位（2.6倍差异），需逐环排查消耗触发点
+- [ ] 🟡 资源消耗日志增强：每次资源消耗记录触发原因和具体数量（目前只有每小时总量，无法定位异常消耗来源）
 - [ ] 更多装饰物
 - [ ] 音效
 - [ ] 存档完善

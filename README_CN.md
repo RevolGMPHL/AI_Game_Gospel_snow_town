@@ -234,8 +234,7 @@ graph TD
 
 ## 🌟 灵感来源
 
-- 🎮 [漫漫长夜 (The Long Dark)](https://www.hinterlandgames.com/the-long-dark/) — 生存氛围与资源管理
-- 🏰 [矮人要塞 (Dwarf Fortress)](http://www.bay12games.com/dwarves/) — 模拟涌现的叙事
+
 - 🤖 [斯坦福生成式智能体](https://github.com/joonspk-research/generative_agents) — LLM 驱动的自主智能体
 - 🌾 [星露谷物语 (Stardew Valley)](https://www.stardewvalley.net/) — 像素风美学与 NPC 关系
 - 🎵 [冰汽时代 (Frostpunk)](https://www.frostpunkgame.com/) — 冰雪城市生存与道德抉择

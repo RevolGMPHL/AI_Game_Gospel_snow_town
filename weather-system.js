@@ -99,6 +99,21 @@ class WeatherSystem {
         this.currentWeather = this.dayConfig.weather;
         this.weatherEmoji = this.dayConfig.weatherEmoji;
 
+        // 【难度系统】应用温度偏移
+        if (this.game && this.game.difficulty && this.game.difficulty.tempOffset) {
+            this.currentTemp -= this.game.difficulty.tempOffset;
+            console.log(`[WeatherSystem-难度] 温度偏移-${this.game.difficulty.tempOffset}°C, 实际基础温度: ${this.currentTemp}°C`);
+        }
+
+        // 【难度系统】户外时间限制缩减
+        if (this.game && this.game.difficulty && this.game.difficulty.outdoorTimePenalty > 0) {
+            const penalty = this.game.difficulty.outdoorTimePenalty;
+            if (this.dayConfig.outdoorTimeLimit !== Infinity && this.dayConfig.outdoorTimeLimit > 0) {
+                this.dayConfig = { ...this.dayConfig, outdoorTimeLimit: Math.max(600, this.dayConfig.outdoorTimeLimit - penalty) };
+                console.log(`[WeatherSystem-难度] 户外时间限制缩减${penalty}秒, 实际限制: ${this.dayConfig.outdoorTimeLimit}秒`);
+            }
+        }
+
         // 【修复】同步到game.weather，确保全局一致
         if (this.game) {
             this.game.weather = this.currentWeather;
@@ -165,11 +180,16 @@ class WeatherSystem {
         }
     }
 
-    /** 根据当前小时计算实际温度（夜间额外降温） */
+    /** 根据当前小时计算实际温度（夜间额外降温 + 难度温度偏移） */
     getEffectiveTemp() {
         const hour = this.game.getHour();
         const isNight = hour < this.dawnHour || hour >= this.duskHour;
-        return this.currentTemp + (isNight ? this.dayConfig.nightTempDrop : 0);
+        let temp = this.currentTemp + (isNight ? this.dayConfig.nightTempDrop : 0);
+        // 【难度系统】温度偏移：高难度下温度额外降低
+        if (this.game && this.game.difficulty && this.game.difficulty.tempOffset) {
+            temp -= this.game.difficulty.tempOffset;
+        }
+        return temp;
     }
 
     /** 是否为白天 */

@@ -9,7 +9,7 @@ const http = require('http');
 const fs = require('fs');
 const path = require('path');
 
-const PORT = 8080;
+const PORT = parseInt(process.env.PORT, 10) || 8080;
 const ROOT_DIR = __dirname;
 const LOG_DIR = path.join(ROOT_DIR, 'log', 'debug_log');
 const AIMODE_LOG_DIR = path.join(ROOT_DIR, 'log', 'aimode_log');
@@ -192,6 +192,35 @@ const server = http.createServer((req, res) => {
         return;
     }
 
+    // ========== Ollama API 代理 ==========
+    // 将 /ollama/* 请求代理到本地 Ollama 服务（11434端口）
+    if (req.url.startsWith('/ollama/')) {
+        const ollamaPath = req.url.replace('/ollama', '');
+        const ollamaUrl = `http://127.0.0.1:11434${ollamaPath}`;
+
+        const ollamaReqOptions = {
+            hostname: '127.0.0.1',
+            port: 11434,
+            path: ollamaPath,
+            method: req.method,
+            headers: { ...req.headers, host: '127.0.0.1:11434' },
+        };
+
+        const proxyReq = http.request(ollamaReqOptions, (proxyRes) => {
+            res.writeHead(proxyRes.statusCode, proxyRes.headers);
+            proxyRes.pipe(res, { end: true });
+        });
+
+        proxyReq.on('error', (err) => {
+            console.error('❌ Ollama代理错误:', err.message);
+            res.writeHead(502, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ error: `Ollama连接失败: ${err.message}` }));
+        });
+
+        req.pipe(proxyReq, { end: true });
+        return;
+    }
+
     // ========== 静态文件服务 ==========
     let filePath = path.join(ROOT_DIR, decodeURIComponent(req.url.split('?')[0]));
     if (filePath === ROOT_DIR + '/' || filePath === ROOT_DIR) {
@@ -232,5 +261,26 @@ server.listen(PORT, '0.0.0.0', () => {
     console.log(`  GET  /api/list-debug-logs   - 列出所有debug log文件`);
     console.log(`  POST /api/save-aimode-log   - 保存AI模式log（覆盖）`);
     console.log(`  POST /api/append-aimode-log - 追加AI模式log（增量）`);
-    console.log(`\n按 Ctrl+C 停止服务器\n`);
+    console.log(`\n💡 切换端口: PORT=8081 node server.js`);
+    console.log(`按 Ctrl+C 停止服务器\n`);
+});
+
+// 优雅退出：收到终止信号时关闭服务器
+process.on('SIGTERM', () => {
+    console.log('\n⏹️ 收到 SIGTERM，正在优雅关闭...');
+    server.close(() => {
+        console.log('✅ 服务器已关闭');
+        process.exit(0);
+    });
+    // 5秒超时强制退出
+    setTimeout(() => process.exit(1), 5000);
+});
+
+process.on('SIGINT', () => {
+    console.log('\n⏹️ 收到 SIGINT，正在优雅关闭...');
+    server.close(() => {
+        console.log('✅ 服务器已关闭');
+        process.exit(0);
+    });
+    setTimeout(() => process.exit(1), 5000);
 });

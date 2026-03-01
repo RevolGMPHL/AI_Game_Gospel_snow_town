@@ -518,13 +518,20 @@ class NPC {
         this.animFrame = 0;
         this.animTimer = 0;
 
-        // Sprite
+        // Sprite（先设onload再设src，避免浏览器缓存命中时onload事件丢失）
         this.sprite = new Image();
-        this.sprite.src = config.spriteDir + '/texture.png';
         this.spriteLoaded = false;
         this.sprite.onload = () => { this.spriteLoaded = true; };
+        this.sprite.onerror = () => { console.warn(`[NPC] ${this.name} sprite加载失败: ${config.spriteDir}/texture.png`); };
+        this.sprite.src = config.spriteDir + '/texture.png';
+        // 缓存兜底：如果图片已在浏览器缓存中同步完成加载
+        if (this.sprite.complete && this.sprite.naturalWidth > 0) {
+            this.spriteLoaded = true;
+        }
 
         this.portrait = new Image();
+        this._portraitLoaded = false;
+        this.portrait.onload = () => { this._portraitLoaded = true; };
         this.portrait.src = config.spriteDir + '/portrait.png';
 
         // AI 状态
@@ -1052,14 +1059,17 @@ this.affinity = { qing_xuan: 72 };
 
         console.log(`[NPC-轮回] ${this.name} 应用第${lifeNum}世轮回加成`);
 
-        // 1. San值加成：min(100, 基础值 + 5 × 世数)
+        // 【难度系统】获取轮回Buff强度倍率
+        const reincBuffMult = (game.getDifficultyMult) ? game.getDifficultyMult('reincarnationBuffMult') : 1.0;
+
+        // 1. San值加成：min(100, 基础值 + 5 × 世数 × 难度倍率)
         if (this.sanity !== undefined) {
-            const bonus = 5 * lifeNum;
+            const bonus = Math.round(5 * lifeNum * reincBuffMult);
             this.sanity = Math.min(100, this.sanity + bonus);
-            console.log(`  San值加成: +${bonus} → ${Math.round(this.sanity)}`);
+            console.log(`  San值加成: +${bonus} (×${reincBuffMult}) → ${Math.round(this.sanity)}`);
         }
 
-        // 2. 上一世死亡同伴好感度+10
+        // 2. 上一世死亡同伴好感度+10（×难度倍率）
         const deathRecords = rs.getLastLifeDeathRecords();
         for (const record of deathRecords) {
             // 通过名字匹配NPC ID
@@ -1068,8 +1078,9 @@ this.affinity = { qing_xuan: 72 };
                 : null;
             if (deadNpc && deadNpc.id !== this.id) {
                 const cur = this.getAffinity(deadNpc.id);
-                this.affinity[deadNpc.id] = Math.min(100, cur + 10);
-                console.log(`  好感度加成: 对${record.name}(上世死亡) +10 → ${this.affinity[deadNpc.id]}`);
+                const affinityBonus = Math.round(10 * reincBuffMult);
+                this.affinity[deadNpc.id] = Math.min(100, cur + affinityBonus);
+                console.log(`  好感度加成: 对${record.name}(上世死亡) +${affinityBonus} → ${this.affinity[deadNpc.id]}`);
             }
         }
 
@@ -3008,7 +3019,9 @@ this.affinity = { qing_xuan: 72 };
 
     _navigateToScheduleTarget(targetKey, game) {
         // 【进屋保护期】NPC刚进入室内时，短暂冻结跨场景导航，防止闪现
-        if (this._indoorEntryProtection > 0 && this.currentScene !== 'village') {
+        // 【修复】P0紧急状态（健康危急/体力不支）无视保护期，必须立即回家
+        const isP0Nav = this._behaviorPriority === 'P0';
+        if (this._indoorEntryProtection > 0 && this.currentScene !== 'village' && !isP0Nav) {
             const loc = SCHEDULE_LOCATIONS[targetKey];
             if (loc && loc.scene !== this.currentScene) {
                 console.log(`[进屋保护] ${this.name} 进屋保护期剩余${this._indoorEntryProtection.toFixed(1)}s，阻止跨场景导航到 ${targetKey}`);
@@ -3016,7 +3029,8 @@ this.affinity = { qing_xuan: 72 };
             }
         }
         // 【出门过程保护】NPC正在走向门口准备出门时，不接受新的导航指令
-        if (this._walkingToDoor) {
+        // 【修复】P0紧急状态无视出门保护，避免卡在门口循环
+        if (this._walkingToDoor && !isP0Nav) {
             console.log(`[出门保护] ${this.name} 正在出门中，阻止新导航到 ${targetKey}`);
             return;
         }
@@ -3100,8 +3114,10 @@ this.affinity = { qing_xuan: 72 };
             } else {
                 // 在其他室内 → 先走到室内门口再出门到村庄
                 // 【天气保护】跨场景导航需经过室外时，检查天气是否允许外出
+                // 【修复】P0紧急状态（健康危急/体力不支）无视天气限制，人都要死了必须回家
                 const wsNav = game && game.weatherSystem;
-                if (wsNav && !wsNav.canGoOutside()) {
+                const isP0Emergency = this._behaviorPriority === 'P0';
+                if (wsNav && !wsNav.canGoOutside() && !isP0Emergency) {
                     console.warn(`[NPC-${this.name}] [天气保护] 跨场景导航需经过室外，但天气禁止外出，NPC留在室内待命`);
                     this.scheduleReached = true;
                     return;
@@ -3229,8 +3245,10 @@ this.affinity = { qing_xuan: 72 };
         }
 
         // 【天气保护】极端天气禁止出门
+        // 【修复】P0紧急状态（健康危急/体力不支）无视天气限制，必须回家
         const ws = game && game.weatherSystem;
-        if (ws && !ws.canGoOutside()) {
+        const isP0Urgent = this._behaviorPriority === 'P0';
+        if (ws && !ws.canGoOutside() && !isP0Urgent) {
             console.warn(`[NPC-${this.name}] [天气保护] 因极端天气取消出门`);
             this._logDebug('schedule', `[天气保护] ${this.name} 因极端天气取消出门`);
             // 不执行出门，也不执行回调
@@ -3278,8 +3296,10 @@ this.affinity = { qing_xuan: 72 };
         }
 
         // 【天气保护】出门过程中检测天气变化，禁止传送到室外
-        const ws = game && game.weatherSystem;
-        if (ws && !ws.canGoOutside()) {
+        // 【修复】P0紧急状态（健康危急/体力不支）无视天气限制，不能卡死在室内
+        const wsCheck = game && game.weatherSystem;
+        const isP0Emg = this._behaviorPriority === 'P0';
+        if (wsCheck && !wsCheck.canGoOutside() && !isP0Emg) {
             console.warn(`[NPC-${this.name}] [天气保护] 出门过程中检测到极端天气，取消出门`);
             this._walkingToDoor = false;
             this._exitDoorCallback = null;
@@ -3927,8 +3947,9 @@ this.currentPath = findPath(pos.x, pos.y, tx, ty, map) || [];
             : '';
 
         // 同场景所有人（包括远处的，让NPC知道这个地方还有谁）
+        // 【P0修复】过滤已死亡NPC，避免LLM对已死角色产生幻觉行为
         const sameSceneNPCs = game.npcs.filter(n => 
-            n.id !== this.id && n.currentScene === this.currentScene && !n.isSleeping
+            n.id !== this.id && !n.isDead && n.currentScene === this.currentScene && !n.isSleeping
         );
         const farNPCs = sameSceneNPCs.filter(n => !nearby.some(nb => nb.id === n.id));
         const sceneOverview = farNPCs.length > 0
@@ -3990,12 +4011,14 @@ ${game.deathSystem && game.deathSystem.isNpcGrieving(this.id) ? '⚠️ 你正�
 ${this.bodyTemp < 35 ? `🚨 你正在失温！体温: ${this.bodyTemp.toFixed(1)}°C，必须立即回暖炉旁！` : ''}
 ${this.isHypothermic ? '🥶 你浑身发抖，行动迟缓，思维模糊...' : ''}
 ${game.reincarnationSystem && game.reincarnationSystem.getLifeNumber() > 1 ? game.reincarnationSystem.getPastLifeHintForThinking(game.mode === 'reincarnation') : ''}
+${game.reincarnationSystem ? game.reincarnationSystem.getWorkPlanSummaryForNpc(this.id) : ''}
+${game.reincarnationSystem ? (() => { const lessons = game.reincarnationSystem.getLessonsForNpc(this.id); return lessons ? '【前世教训·与你相关】' + lessons : ''; })() : ''}
 
 重要规则：
 1. 这是一个末日生存环境。你的首要目标是活下去，其次是帮助同伴活下去。
 2. 你的情绪和言行必须和当前生存环境一致。如果资源紧缺，你应该焦虑；如果有人死了，你应该悲痛或恐惧。
 3. expression是你真正说出口的话，应该围绕生存话题（"还有多少食物？""暖炉够不够？""今天的任务完成了吗？"）。
-4. 如果你被分配了任务，你应该积极去完成它。你的专长决定了你在团队中的角色。
+4. 🎯【最高优先】你必须严格执行工作安排表中的分工（见上方安排表中★标记的任务）。安排表是全镇指挥中心基于前世教训制定的最优方案，这是你的核心职责！你的思考应该围绕如何高效完成分配给你的任务。
 5. 你的思考和行为应该受到你当前身心状态和生存压力的影响。
 6. 如果温度极低（<-20°C），你在户外会非常痛苦和恐惧。
 7. 如果你看到有人倒下或状态很差，你应该去帮助他们。
@@ -4323,13 +4346,15 @@ ${this._priorityOverride ? `⚠️ 当前P0紧急状态：${this._priorityOverri
         // 获取当前日程描述
         const schedIdx = this.currentScheduleIdx;
         if (schedIdx < 0 || !this.scheduleTemplate[schedIdx]) return;
-        const currentDesc = this.stateDesc || this.scheduleTemplate[schedIdx].desc || '';
+        const scheduleDesc = this.scheduleTemplate[schedIdx].desc || '';
+        const currentDesc = this.stateDesc || scheduleDesc;
 
         // 在ACTION_EFFECT_MAP中查找匹配的效果
+        // 【P0修复】同时匹配 stateDesc 和日程原始 desc，防止 LLM 行动决策覆盖 stateDesc 后关键词丢失
         let matchedEffect = null;
         for (const entry of ACTION_EFFECT_MAP) {
             for (const keyword of entry.keywords) {
-                if (currentDesc.includes(keyword)) {
+                if (currentDesc.includes(keyword) || scheduleDesc.includes(keyword)) {
                     matchedEffect = entry;
                     break;
                 }
@@ -4889,6 +4914,9 @@ ${this._priorityOverride ? `⚠️ 当前P0紧急状态：${this._priorityOverri
         // ---- 饥饿自然衰减（清醒时持续缓慢下降）----
         // 基础衰减速率：0.5/游戏小时 = 0.000139/秒
         let hungerDecayRate = 0.000139;
+        // 【难度系统】饱腹衰减乘以难度倍率
+        const _diffHungerMult = game.getDifficultyMult ? game.getDifficultyMult('hungerDecayMult') : 1.0;
+        hungerDecayRate *= _diffHungerMult;
         const ws = game.weatherSystem;
         const currentTemp = ws ? ws.getEffectiveTemp() : 0;
         // 户外寒冷环境（温度<-20°C）时衰减加速至2倍
@@ -4907,7 +4935,10 @@ ${this._priorityOverride ? `⚠️ 当前P0紧急状态：${this._priorityOverri
         const isWorking = this.workplaceName && this.currentScene === this.workplaceName;
         // 【增强】健康低时体力消耗加快（身体虚弱更容易累）
         const healthPenalty = this.health < 30 ? 1.5 : (this.health < 50 ? 1.2 : 1.0);
-        const staminaDrain = (isWorking ? 0.10 : 0.05) * healthPenalty;
+        const baseStaminaDrain = (isWorking ? 0.10 : 0.05) * healthPenalty;
+        // 【难度系统】体力衰减乘以难度倍率
+        const _diffStaminaMult = game.getDifficultyMult ? game.getDifficultyMult('staminaDrainMult') : 1.0;
+        const staminaDrain = baseStaminaDrain * _diffStaminaMult;
         this.stamina = Math.max(0, this.stamina - staminaDrain * dt);
 
         // 吃饭恢复体力【体力恢复快】
@@ -5080,7 +5111,10 @@ ${this._priorityOverride ? `⚠️ 当前P0紧急状态：${this._priorityOverri
 
         // ---- San值变化【变化快】----
         // debug模式下San值下降加速，方便测试低San值效果
-        const sanDropMult = (game.mode === 'debug') ? 5 : 1;
+        const baseSanDropMult = (game.mode === 'debug') ? 5 : 1;
+        // 【难度系统】San值衰减乘以难度倍率
+        const _diffSanMult = game.getDifficultyMult ? game.getDifficultyMult('sanDecayMult') : 1.0;
+        const sanDropMult = baseSanDropMult * _diffSanMult;
         const sanBefore = this.sanity; // 【Debug】记录变化前的San值
         const sanSources = [];         // 【Debug】记录所有变化来源
 
@@ -5250,6 +5284,10 @@ ${this._priorityOverride ? `⚠️ 当前P0紧急状态：${this._priorityOverri
                 this.expressionTimer = 10;
                 if (game.addEvent) {
                     game.addEvent(`🤯 ${this.name} 精神崩溃发疯了！(San:${Math.round(this.sanity)})`);
+                }
+                // 【事件驱动镜头】通知镜头系统：NPC发疯
+                if (game.onNPCEvent) {
+                    game.onNPCEvent(this, 'crazy');
                 }
             }
         }
@@ -6182,7 +6220,10 @@ ${this._priorityOverride ? `⚠️ 当前P0紧急状态：${this._priorityOverri
 
         // 【强制进食保护】饥饿<10 且有食物且正在睡觉：最最高优先级，打断睡眠去吃饭
         // 【修复】不能饿着肚子睡觉！饱腹=0时必须醒来去吃饭
-        if (this.hunger < 10 && hasFoodAvailable && this.isSleeping && !this._hungerOverride && !this.isEating && this._hungerTriggerCooldown <= 0) {
+        // 【跳夜保护】深夜时段（20:00~06:00）如果跳夜即将触发，不要饿醒NPC，等跳夜后统一处理
+        const nightSkipHour = game.getHour();
+        const isNightSkipWindow = (nightSkipHour >= 20 || nightSkipHour < 6) && !game._nightSkipDone;
+        if (this.hunger < 10 && hasFoodAvailable && this.isSleeping && !this._hungerOverride && !this.isEating && this._hungerTriggerCooldown <= 0 && !isNightSkipWindow) {
             console.warn(`[NPC] ${this.name} 饱腹极低(${Math.round(this.hunger)})且在睡觉，打断睡眠去吃饭！`);
             if (game.addEvent) {
                 game.addEvent(`🚨 ${this.name} 饿醒了(饱腹${Math.round(this.hunger)})，必须先去吃饭！`);
@@ -7206,8 +7247,9 @@ _checkEatingArrival(dt, game) {
             .join('\n');
 
         // 同场景所有NPC状态
+        // 【P0修复】过滤已死亡NPC，避免LLM让存活NPC去"安抚"已死角色
         const allNPCStatus = game.npcs
-            .filter(n => n.id !== this.id)
+            .filter(n => n.id !== this.id && !n.isDead)
             .map(n => {
                 const tags = [];
                 if (n.isSick) tags.push('生病');
@@ -7228,8 +7270,9 @@ _checkEatingArrival(dt, game) {
             }).join('\n');
 
         // 【挚友紧急告警】检测好友/挚友中是否有人精神状态极差
+        // 【P0修复】过滤已死亡NPC，防止LLM安抚死人
         const friendsInCrisis = game.npcs.filter(n => 
-            n.id !== this.id && !n.isSleeping && this.getAffinity(n.id) >= 70
+            n.id !== this.id && !n.isDead && !n.isSleeping && this.getAffinity(n.id) >= 70
             && (n.sanity < 25 || n.isCrazy)
         );
         let friendCrisisHint = '';
@@ -7258,10 +7301,13 @@ ${game.resourceSystem ? `资源紧张度: ${game.resourceSystem.getResourceTensi
 ${game.taskSystem ? `你的任务: ${game.taskSystem.getNpcTaskDescForPrompt(this.id)}` : ''}
 ${this.bodyTemp < 35 ? `🚨 你正在失温！体温: ${this.bodyTemp.toFixed(1)}°C` : ''}
 ${game.reincarnationSystem && game.reincarnationSystem.getLifeNumber() > 1 ? game.reincarnationSystem.getPastLifeHintForThinking(game.mode === 'reincarnation') : ''}
+${game.reincarnationSystem ? game.reincarnationSystem.getWorkPlanSummaryForNpc(this.id) : ''}
+${game.reincarnationSystem ? (() => { const lessons = game.reincarnationSystem.getLessonsForNpc(this.id); return lessons ? '【前世教训·与你相关】' + lessons : ''; })() : ''}
 
 决策规则：
 1. 你的首要目标是在末日中存活。其次是帮助同伴存活。
-2. 你有被分配的生存任务（见「你的任务」），应该优先完成任务。任务完成情况直接影响全镇生存。
+2. 🎯【最高优先】你必须严格执行工作安排表中的分工（见上方安排表中★标记的任务）。安排表是全镇指挥中心基于前世教训制定的最优方案，不要擅自偏离！除非身体状态危急（体力<30/健康<30/体温<35°C），否则必须按安排执行。
+3. 你有被分配的生存任务（见「你的任务」），应该优先完成任务。任务完成情况直接影响全镇生存。
 3. 🚨如果体力<30/健康<30/体温<35°C，必须立即回暖炉旁休息！priority=urgent！
 4. 🚨如果精神<20，必须立刻恢复精神！否则你会发疯攻击朋友！priority=urgent！
 5. 如果很饿，应该去吃饭，priority=urgent。
@@ -7386,6 +7432,77 @@ ${friendCrisisHint}
                     const alt = alts[Math.floor(Math.random() * alts.length)];
                     action.target = alt.target;
                     action.reason += '（下雨了，改去室内）';
+                }
+
+                // ============ 【任务9】决策硬性约束拦截 ============
+
+                // 【拦截1】第4天(暴风雪天)-60°C严禁户外 → 强制stay
+                if (game.weatherSystem && !game.weatherSystem.canGoOutside()) {
+                    if (action.target && NPC.OUTDOOR_TARGETS && NPC.OUTDOOR_TARGETS.has(action.target)) {
+                        console.log(`[决策拦截] ${this.name} 第4天企图外出(${action.target})，强制stay！`);
+                        if (game.addEvent) game.addEvent(`🚫 ${this.name}想去${action.target}被拦截：暴风雪天严禁外出！`);
+                        action.type = 'stay';
+                        action.target = null;
+                        action.reason = '暴风雪天严禁外出，留在室内';
+                        action.priority = 'urgent';
+                        this._logDebug('action', `[硬性拦截] 暴风雪天企图外出→强制stay`);
+                    }
+                    // 第4天 rest也只能在室内
+                    if (action.type === 'rest' && this.currentScene === 'village') {
+                        action.type = 'go_to';
+                        action.target = this.homeName + '_door';
+                        action.reason = '暴风雪天必须回室内';
+                        action.priority = 'urgent';
+                    }
+                }
+
+                // 【拦截2】暴风雪期间强制户外NPC回室内
+                if (game.weatherSystem && game.weatherSystem.currentWeather === '暴风雪' && this.currentScene === 'village') {
+                    if (action.type !== 'go_to' || !action.target || NPC.OUTDOOR_TARGETS.has(action.target)) {
+                        console.log(`[决策拦截] ${this.name} 暴风雪中在户外(village)，强制回室内！`);
+                        if (game.addEvent) game.addEvent(`🌨️ ${this.name}在暴风雪中，被强制回室内避难！`);
+                        action.type = 'go_to';
+                        action.target = this.homeName + '_door';
+                        action.reason = '暴风雪中必须立即回室内！';
+                        action.priority = 'urgent';
+                        this._logDebug('action', `[硬性拦截] 暴风雪户外→强制回室内`);
+                    }
+                }
+
+                // 【拦截3】体温极低时强制回暖炉
+                if (this.bodyTemp < 33) {
+                    if (action.type !== 'rest' && action.type !== 'go_to') {
+                        console.log(`[决策拦截] ${this.name} 体温${this.bodyTemp.toFixed(1)}°C极低，强制rest！`);
+                        action.type = 'rest';
+                        action.target = 'furnace_main';
+                        action.reason = '严重失温，必须立即回暖炉旁！';
+                        action.priority = 'urgent';
+                        this._logDebug('action', `[硬性拦截] 体温${this.bodyTemp.toFixed(1)}°C→强制回暖炉`);
+                    }
+                }
+
+                // 【拦截4】健康<10时强制去医院
+                if (this.health < 10 && !this._isBeingTreated) {
+                    if (action.target !== 'medical_door' && action.type !== 'rest') {
+                        console.log(`[决策拦截] ${this.name} 健康${Math.round(this.health)}极低，强制去医院！`);
+                        action.type = 'go_to';
+                        action.target = 'medical_door';
+                        action.reason = '健康濒危，必须立即去医院！';
+                        action.priority = 'urgent';
+                        this._logDebug('action', `[硬性拦截] 健康${Math.round(this.health)}→强制去医院`);
+                    }
+                }
+
+                // 【拦截5】工作安排表合规检查：如果有workPlan且NPC选了完全无关的行动，纠正
+                if (game.reincarnationSystem && !inDanger) {
+                    const wpSummary = game.reincarnationSystem.getWorkPlanSummaryForNpc(this.id);
+                    if (wpSummary && action.type === 'wander') {
+                        // 有安排表时禁止闲逛
+                        console.log(`[决策拦截] ${this.name} 有工作安排但选了wander，改为work`);
+                        action.type = 'work';
+                        action.reason = '按工作安排表执行任务';
+                        this._logDebug('action', `[硬性拦截] 有安排表禁止wander→改为work`);
+                    }
                 }
 
                 // 记录决策理由
@@ -8324,6 +8441,7 @@ ${friendCrisisHint}
         const result = [];
         for (const npc of game.npcs) {
             if (npc.id === this.id) continue;
+            if (npc.isDead) continue; // 【P0修复】跳过已死亡的NPC
             if (npc.currentScene !== this.currentScene) continue;
             if (npc.isSleeping) continue; // 跳过睡觉中的NPC
             const np = npc.getGridPos();

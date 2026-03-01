@@ -413,6 +413,11 @@ let reply = await callLLM(systemPrompt, userPrompt, debugMode2 ? 100 : 300);
         npc1.state = 'CHATTING';
         npc2.state = 'CHATTING';
 
+        // 【事件驱动镜头】通知镜头系统：对话开始
+        if (this.game && this.game.onNPCEvent) {
+            this.game.onNPCEvent(npc1, 'chat_start');
+        }
+
         // 【关键修复】对话开始时立即清除双方的移动路径和相关状态
         // 防止NPC在等待LLM响应时继续沿路径走动、被传送到其他场景
         npc1.currentPath = [];

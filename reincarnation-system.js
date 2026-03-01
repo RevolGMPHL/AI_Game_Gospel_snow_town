@@ -576,6 +576,491 @@ class ReincarnationSystem {
         return record ? record.cause : null;
     }
 
+    // ============ 【需求1】轮回经验自动生成分工方案 ============
+
+    /**
+     * 基于前世数据生成本世分工方案
+     * 在每世开始时由game.js调用，结果存储到老钱的workPlan属性
+     * @returns {{ dayPlans: Object, summary: string, workPlanSummary: string }} 分工方案
+     */
+    generateWorkPlan() {
+        const pastLives = this.pastLives;
+        const lifeNum = this.currentLifeNumber;
+
+        // 第1世无前世记忆：返回默认方案
+        if (lifeNum <= 1 || pastLives.length === 0) {
+            return this._getDefaultWorkPlan();
+        }
+
+        const lastLife = pastLives[pastLives.length - 1];
+        const multiLifeAnalysis = this.analyzeMultiLifePatterns();
+
+        // 前世全员存活：基本保持不变，微调过剩资源
+        if (lastLife.aliveCount >= 8) {
+            return this._generateOptimizedPlan(lastLife, multiLifeAnalysis, 'maintain');
+        }
+
+        // 存活人数下降：激进调整
+        return this._generateOptimizedPlan(lastLife, multiLifeAnalysis, 'aggressive');
+    }
+
+    /** 第1世默认分工方案（等价于task-system的硬编码） */
+    _getDefaultWorkPlan() {
+        const plan = {
+            dayPlans: {
+                1: [
+                    { npcId: 'zhao_chef', task: 'COLLECT_WOOD', targetLocation: 'lumber_camp', reason: '默认：砍柴' },
+                    { npcId: 'lu_chen', task: 'COLLECT_MATERIAL', targetLocation: 'ruins_site', reason: '默认：采建材' },
+                    { npcId: 'li_shen', task: 'COLLECT_FOOD', targetLocation: 'frozen_lake', reason: '默认：采食物' },
+                    { npcId: 'wang_teacher', task: 'MAINTAIN_POWER', targetLocation: 'workshop_door', reason: '默认：维护电力' },
+                    { npcId: 'old_qian', task: 'COORDINATE', targetLocation: 'furnace_plaza', reason: '默认：统筹协调' },
+                    { npcId: 'su_doctor', task: 'PREPARE_MEDICAL', targetLocation: 'medical_door', reason: '默认：医疗准备' },
+                    { npcId: 'ling_yue', task: 'SCOUT_RUINS', targetLocation: 'ruins_site', reason: '默认：废墟侦察' },
+                    { npcId: 'qing_xuan', task: 'CRAFT_MEDICINE', targetLocation: 'medical_door', reason: '默认：制药' },
+                ],
+                2: [
+                    { npcId: 'zhao_chef', task: 'COLLECT_WOOD', targetLocation: 'lumber_camp', reason: '冒险砍柴(限2h)' },
+                    { npcId: 'lu_chen', task: 'COLLECT_FOOD', targetLocation: 'frozen_lake', reason: '冒险采食(限2h)' },
+                    { npcId: 'li_shen', task: 'DISTRIBUTE_FOOD', targetLocation: 'kitchen_door', reason: '分配食物' },
+                    { npcId: 'wang_teacher', task: 'MAINTAIN_POWER', targetLocation: 'workshop_door', reason: '维护电力' },
+                    { npcId: 'old_qian', task: 'MAINTAIN_ORDER', targetLocation: 'furnace_plaza', reason: '安抚情绪' },
+                    { npcId: 'su_doctor', task: 'PREPARE_MEDICAL', targetLocation: 'medical_door', reason: '医疗待命' },
+                    { npcId: 'ling_yue', task: 'BOOST_MORALE', targetLocation: 'furnace_plaza', reason: '鼓舞士气' },
+                    { npcId: 'qing_xuan', task: 'CRAFT_MEDICINE', targetLocation: 'medical_door', reason: '制药' },
+                ],
+                3: [
+                    { npcId: 'zhao_chef', task: 'COLLECT_WOOD', targetLocation: 'lumber_camp', reason: '补充木柴为第4天' },
+                    { npcId: 'lu_chen', task: 'BUILD_FURNACE', targetLocation: 'dorm_b_door', reason: '建第二暖炉' },
+                    { npcId: 'li_shen', task: 'COLLECT_FOOD', targetLocation: 'frozen_lake', reason: '补充食物' },
+                    { npcId: 'wang_teacher', task: 'BUILD_FURNACE', targetLocation: 'dorm_b_door', reason: '建第二暖炉' },
+                    { npcId: 'old_qian', task: 'COORDINATE', targetLocation: 'furnace_plaza', reason: '统筹第4天准备' },
+                    { npcId: 'su_doctor', task: 'PREPARE_MEDICAL', targetLocation: 'medical_door', reason: '医疗准备' },
+                    { npcId: 'ling_yue', task: 'SCOUT_RUINS', targetLocation: 'ruins_site', reason: '最后侦察' },
+                    { npcId: 'qing_xuan', task: 'REPAIR_RADIO', targetLocation: 'workshop_door', reason: '修无线电' },
+                ],
+                4: [
+                    { npcId: 'zhao_chef', task: 'MAINTAIN_FURNACE', targetLocation: 'furnace_plaza', reason: '维护暖炉(室内)' },
+                    { npcId: 'lu_chen', task: 'MAINTAIN_FURNACE', targetLocation: 'furnace_plaza', reason: '维护暖炉(室内)' },
+                    { npcId: 'li_shen', task: 'DISTRIBUTE_FOOD', targetLocation: 'kitchen_door', reason: '分配食物(室内)' },
+                    { npcId: 'wang_teacher', task: 'MAINTAIN_POWER', targetLocation: 'workshop_door', reason: '维护电力(室内)' },
+                    { npcId: 'old_qian', task: 'MAINTAIN_ORDER', targetLocation: 'furnace_plaza', reason: '维持秩序(室内)' },
+                    { npcId: 'su_doctor', task: 'PREPARE_MEDICAL', targetLocation: 'medical_door', reason: '医疗待命(室内)' },
+                    { npcId: 'ling_yue', task: 'BOOST_MORALE', targetLocation: 'furnace_plaza', reason: '鼓舞士气(室内)' },
+                    { npcId: 'qing_xuan', task: 'CRAFT_MEDICINE', targetLocation: 'medical_door', reason: '制药(室内)' },
+                ],
+            },
+            strategy: 'default',
+            summary: '第1世：默认分工方案',
+            workPlanSummary: '第1世默认:赵砍柴,陆建材,李食物,王电力,钱统筹,苏医疗,玥侦察,璇制药',
+        };
+        return plan;
+    }
+
+    /** 基于前世数据优化分工方案 */
+    _generateOptimizedPlan(lastLife, multiLifeAnalysis, mode) {
+        // 从默认方案开始，然后根据前世数据调整
+        const plan = this._getDefaultWorkPlan();
+        plan.strategy = mode;
+
+        const rs = lastLife.resourceSnapshot;
+        const deaths = lastLife.deathRecords || [];
+        const lessons = this._generateDeepLessons(lastLife);
+
+        // ===== 资源瓶颈分析 =====
+        const bottlenecks = this._analyzeResourceBottlenecks(rs);
+
+        // ===== Day 1 调整 =====
+        if (bottlenecks.woodFuel === 'critical') {
+            // 木柴严重不足：增派陆辰也去砍柴
+            plan.dayPlans[1] = plan.dayPlans[1].map(a => {
+                if (a.npcId === 'lu_chen') return { ...a, task: 'COLLECT_WOOD', targetLocation: 'lumber_camp', reason: `前世木柴仅剩${rs.woodFuel}，增派砍柴` };
+                return a;
+            });
+        }
+        if (bottlenecks.food === 'critical') {
+            // 食物严重不足：凌玥改为采集食物
+            plan.dayPlans[1] = plan.dayPlans[1].map(a => {
+                if (a.npcId === 'ling_yue') return { ...a, task: 'COLLECT_FOOD', targetLocation: 'frozen_lake', reason: `前世食物仅剩${rs.food}，增派采食物` };
+                return a;
+            });
+        }
+        if (bottlenecks.material === 'critical' && !lastLife.secondFurnaceBuilt) {
+            // 建材不足且暖炉未建：第1天就让陆辰采建材
+            plan.dayPlans[1] = plan.dayPlans[1].map(a => {
+                if (a.npcId === 'lu_chen') return { ...a, task: 'COLLECT_MATERIAL', targetLocation: 'ruins_site', reason: '前世暖炉未建，优先建材' };
+                return a;
+            });
+        }
+
+        // ===== Day 2 调整（户外限2h）=====
+        const day2FrozenDeaths = deaths.filter(d => d.cause === '冻死' && d.day <= 2);
+        if (day2FrozenDeaths.length > 0 && mode === 'aggressive') {
+            // 前世第2天有人冻死：减少户外工作，全部转室内
+            plan.dayPlans[2] = plan.dayPlans[2].map(a => {
+                if (a.task === 'COLLECT_WOOD' || a.task === 'COLLECT_FOOD' || a.task === 'SCOUT_RUINS') {
+                    return { ...a, task: 'MAINTAIN_FURNACE', targetLocation: 'furnace_plaza', reason: `前世${day2FrozenDeaths.map(d => d.name).join('、')}第2天冻死，改为室内维护` };
+                }
+                return a;
+            });
+        }
+
+        // ===== Day 3 调整 =====
+        if (!lastLife.secondFurnaceBuilt) {
+            // 前世暖炉未建：增派赵铁柱也去建暖炉
+            plan.dayPlans[3] = plan.dayPlans[3].map(a => {
+                if (a.npcId === 'zhao_chef') return { ...a, task: 'BUILD_FURNACE', targetLocation: 'dorm_b_door', reason: '前世暖炉未建！全力建造' };
+                return a;
+            });
+        }
+        if (bottlenecks.power === 'critical') {
+            // 电力不足：第3天清璇也去维护电力
+            plan.dayPlans[3] = plan.dayPlans[3].map(a => {
+                if (a.npcId === 'qing_xuan') return { ...a, task: 'MAINTAIN_POWER', targetLocation: 'workshop_door', reason: `前世电力仅剩${rs.power}，增派维护` };
+                return a;
+            });
+        }
+
+        // ===== 应用多世模式分析 =====
+        if (multiLifeAnalysis && multiLifeAnalysis.failurePatterns.length > 0) {
+            for (const pattern of multiLifeAnalysis.failurePatterns) {
+                if (pattern.includes('木柴') && pattern.includes('连续')) {
+                    // 连续多世木柴不足：第1天派3人砍柴
+                    plan.dayPlans[1] = plan.dayPlans[1].map(a => {
+                        if (a.npcId === 'ling_yue') return { ...a, task: 'COLLECT_WOOD', targetLocation: 'lumber_camp', reason: '🔴连续多世木柴不足！全力砍柴' };
+                        return a;
+                    });
+                }
+                if (pattern.includes('食物') && pattern.includes('连续')) {
+                    plan.dayPlans[1] = plan.dayPlans[1].map(a => {
+                        if (a.npcId === 'ling_yue') return { ...a, task: 'COLLECT_FOOD', targetLocation: 'frozen_lake', reason: '🔴连续多世食物不足！全力采集' };
+                        return a;
+                    });
+                }
+            }
+        }
+
+        // ===== 前世全员存活时的微调 =====
+        if (mode === 'maintain' && rs) {
+            // 找过剩资源，将对应人力转到最缺的资源
+            const surplus = [];
+            const deficit = [];
+            if (rs.woodFuel > 80) surplus.push('woodFuel');
+            else if (rs.woodFuel < 30) deficit.push('woodFuel');
+            if (rs.food > 40) surplus.push('food');
+            else if (rs.food < 15) deficit.push('food');
+            if (rs.power > 50) surplus.push('power');
+            else if (rs.power < 15) deficit.push('power');
+
+            // 如果有过剩且有缺口，调整Day1
+            if (surplus.length > 0 && deficit.length > 0) {
+                const surplusTask = surplus[0] === 'woodFuel' ? 'COLLECT_WOOD' : surplus[0] === 'food' ? 'COLLECT_FOOD' : 'MAINTAIN_POWER';
+                const deficitTask = deficit[0] === 'woodFuel' ? 'COLLECT_WOOD' : deficit[0] === 'food' ? 'COLLECT_FOOD' : 'MAINTAIN_POWER';
+                const deficitLoc = deficit[0] === 'woodFuel' ? 'lumber_camp' : deficit[0] === 'food' ? 'frozen_lake' : 'workshop_door';
+                // 找第一个做过剩资源的NPC改为做缺口资源
+                for (let i = 0; i < plan.dayPlans[1].length; i++) {
+                    if (plan.dayPlans[1][i].task === surplusTask) {
+                        plan.dayPlans[1][i] = { ...plan.dayPlans[1][i], task: deficitTask, targetLocation: deficitLoc, reason: `前世${surplus[0]}过剩(${rs[surplus[0]]}),调去补${deficit[0]}` };
+                        break;
+                    }
+                }
+            }
+        }
+
+        // 生成摘要（≤200字符）
+        plan.summary = `第${this.currentLifeNumber}世(${mode}):基于前世${lastLife.aliveCount}/8存活调整`;
+        plan.workPlanSummary = this._generateWorkPlanSummary(plan);
+
+        console.log(`[WorkPlan] 第${this.currentLifeNumber}世分工方案生成:`, plan.summary);
+        return plan;
+    }
+
+    /** 分析资源瓶颈 */
+    _analyzeResourceBottlenecks(rs) {
+        if (!rs) return {};
+        const result = {};
+        // 木柴
+        if (rs.woodFuel < 15) result.woodFuel = 'critical';
+        else if (rs.woodFuel < 40) result.woodFuel = 'warning';
+        else result.woodFuel = 'ok';
+        // 食物
+        if (rs.food < 8) result.food = 'critical';
+        else if (rs.food < 20) result.food = 'warning';
+        else result.food = 'ok';
+        // 电力
+        if (rs.power < 10) result.power = 'critical';
+        else if (rs.power < 25) result.power = 'warning';
+        else result.power = 'ok';
+        // 建材
+        if (rs.material < 10) result.material = 'critical';
+        else if (rs.material < 30) result.material = 'warning';
+        else result.material = 'ok';
+        return result;
+    }
+
+    /** 生成工作安排摘要（≤200字符） */
+    _generateWorkPlanSummary(plan) {
+        const nameMap = { zhao_chef: '赵', lu_chen: '陆', li_shen: '李', wang_teacher: '王', old_qian: '钱', su_doctor: '苏', ling_yue: '玥', qing_xuan: '璇' };
+        const taskShort = { COLLECT_WOOD: '砍柴', COLLECT_FOOD: '采食', COLLECT_MATERIAL: '建材', MAINTAIN_POWER: '电力', COORDINATE: '统筹', PREPARE_MEDICAL: '医疗', SCOUT_RUINS: '侦察', CRAFT_MEDICINE: '制药', BOOST_MORALE: '鼓舞', BUILD_FURNACE: '建炉', MAINTAIN_FURNACE: '维炉', MAINTAIN_ORDER: '秩序', DISTRIBUTE_FOOD: '分食', REPAIR_RADIO: '电台', REST_RECOVER: '休息' };
+        // 只输出Day1的安排
+        const day1 = (plan.dayPlans[1] || []).map(a => `${nameMap[a.npcId] || '?'}${taskShort[a.task] || a.task}`).join(',');
+        let summary = `D1:${day1}`;
+        if (summary.length > 200) summary = summary.substring(0, 197) + '…';
+        return summary;
+    }
+
+    // ============ 【需求3】前世教训深度分析 ============
+
+    /** 深度教训生成（分层：战略/战术/执行） */
+    _generateDeepLessons(lastLife) {
+        const strategic = [];  // 战略层
+        const tactical = [];   // 战术层（与特定NPC相关）
+        const execution = [];  // 执行层（具体行动建议）
+
+        const rs = lastLife.resourceSnapshot;
+        const deaths = lastLife.deathRecords || [];
+        const npcStates = lastLife.npcFinalStates || [];
+        const unfinished = lastLife.unfinishedTasks || [];
+
+        // ===== 资源比例分析 =====
+        if (rs && rs.totalCollected) {
+            const tc = rs.totalCollected;
+            const total = (tc.woodFuel || 0) + (tc.food || 0) + (tc.power || 0) + (tc.material || 0);
+            if (total > 0) {
+                const woodRatio = (tc.woodFuel || 0) / total;
+                const foodRatio = (tc.food || 0) / total;
+                const powerRatio = (tc.power || 0) / total;
+                // 检测偏科
+                if (woodRatio > 0.5) strategic.push(`资源分配偏科：木柴占采集总量${Math.round(woodRatio * 100)}%，其他资源被忽视`);
+                if (foodRatio < 0.15 && rs.food < 20) strategic.push(`食物采集严重不足，仅占总采集量${Math.round(foodRatio * 100)}%`);
+                if (powerRatio < 0.1 && rs.power < 15) strategic.push(`电力维护不足，仅占总采集量${Math.round(powerRatio * 100)}%`);
+            }
+        }
+
+        // ===== 人力分配分析 =====
+        for (const state of npcStates) {
+            if (state.isDead) continue;
+            // 体力还很高的NPC → 可能没充分利用
+            if (state.stamina > 70) {
+                tactical.push(`${state.name}体力剩余${state.stamina}%，劳动力未充分利用，可增加工作量`);
+            }
+            // San值极低但未死 → 缺乏精神维护
+            if (state.sanity < 20) {
+                tactical.push(`${state.name}精神濒危(San:${state.sanity})，需要更多安抚和休息`);
+            }
+        }
+
+        // ===== 时序分析 =====
+        const deathsByDay = {};
+        for (const d of deaths) {
+            if (!deathsByDay[d.day]) deathsByDay[d.day] = [];
+            deathsByDay[d.day].push(d);
+        }
+        for (const [day, dayDeaths] of Object.entries(deathsByDay)) {
+            if (dayDeaths.length >= 2) {
+                strategic.push(`第${day}天有${dayDeaths.length}人死亡(${dayDeaths.map(d => d.name + d.cause).join('、')})，该天安排严重失误`);
+            }
+        }
+
+        // ===== 因果链推导 =====
+        const frozenDeaths = deaths.filter(d => d.cause === '冻死');
+        if (frozenDeaths.length > 0) {
+            if (rs && rs.woodFuel < 20) {
+                execution.push(`因果链：木柴不足(剩${rs.woodFuel}) → ${frozenDeaths.map(d => d.name).join('、')}冻死 → 赵铁柱+陆辰应专注砍柴`);
+            }
+            const outdoorFrozen = frozenDeaths.filter(d => d.location === 'village');
+            if (outdoorFrozen.length > 0) {
+                execution.push(`因果链：${outdoorFrozen.map(d => d.name).join('、')}在户外冻死 → 第${outdoorFrozen[0].day}天必须限制户外时间`);
+            }
+        }
+
+        const starvedDeaths = deaths.filter(d => d.cause === '饿死');
+        if (starvedDeaths.length > 0) {
+            execution.push(`因果链：食物不足(剩${rs ? rs.food : '?'}) → ${starvedDeaths.map(d => d.name).join('、')}饿死 → 李婶+陆辰应多采集食物`);
+        }
+
+        // 暖炉未建因果链
+        if (!lastLife.secondFurnaceBuilt) {
+            const day4Deaths = deaths.filter(d => d.day >= 4);
+            if (day4Deaths.length > 0) {
+                execution.push(`因果链：第二暖炉未建 → 第4天供暖不足 → ${day4Deaths.map(d => d.name).join('、')}死亡 → 第3天必须全力建暖炉`);
+            } else {
+                execution.push(`第二暖炉未建成，第3天必须优先安排赵铁柱+陆辰+王策建造`);
+            }
+        }
+
+        // ===== 连续多世相同问题检测 =====
+        if (this.pastLives.length >= 2) {
+            const prev = this.pastLives[this.pastLives.length - 2];
+            const last = this.pastLives[this.pastLives.length - 1];
+            // 连续木柴不足
+            if (prev.resourceSnapshot && last.resourceSnapshot && prev.resourceSnapshot.woodFuel < 30 && last.resourceSnapshot.woodFuel < 30) {
+                strategic.unshift(`🔴 连续2世木柴严重不足！必须大幅增加砍柴人手`);
+            }
+            // 连续食物不足
+            if (prev.resourceSnapshot && last.resourceSnapshot && prev.resourceSnapshot.food < 15 && last.resourceSnapshot.food < 15) {
+                strategic.unshift(`🔴 连续2世食物不足！必须大幅增加食物采集`);
+            }
+            // 连续暖炉未建
+            if (!prev.secondFurnaceBuilt && !last.secondFurnaceBuilt) {
+                strategic.unshift(`🔴 连续2世暖炉未建！第1天就必须开始采建材`);
+            }
+            // 连续同一天大量死亡
+            for (let day = 1; day <= 4; day++) {
+                const prevDeaths = (prev.deathRecords || []).filter(d => d.day === day).length;
+                const lastDeaths = (last.deathRecords || []).filter(d => d.day === day).length;
+                if (prevDeaths >= 2 && lastDeaths >= 2) {
+                    strategic.unshift(`🔴 连续2世在第${day}天大量死亡！该天策略完全失败，需彻底改变`);
+                }
+            }
+        }
+
+        return { strategic, tactical, execution };
+    }
+
+    // ============ 【需求6】多世学习演进 ============
+
+    /** 综合多世数据识别成功/失败模式 */
+    analyzeMultiLifePatterns() {
+        if (this.pastLives.length < 2) {
+            return { successPatterns: [], failurePatterns: [], trends: {} };
+        }
+
+        const lives = this.pastLives.slice(-3); // 最近3世
+        const successPatterns = [];
+        const failurePatterns = [];
+        const trends = { aliveCount: [], woodFuel: [], food: [], power: [] };
+
+        // 收集趋势数据
+        for (const life of lives) {
+            trends.aliveCount.push(life.aliveCount);
+            if (life.resourceSnapshot) {
+                trends.woodFuel.push(life.resourceSnapshot.woodFuel);
+                trends.food.push(life.resourceSnapshot.food);
+                trends.power.push(life.resourceSnapshot.power);
+            }
+        }
+
+        // 分析存活趋势
+        if (trends.aliveCount.length >= 2) {
+            const last = trends.aliveCount[trends.aliveCount.length - 1];
+            const prev = trends.aliveCount[trends.aliveCount.length - 2];
+            if (last > prev) {
+                successPatterns.push(`存活人数从${prev}提升到${last}，策略在改善`);
+            } else if (last < prev) {
+                failurePatterns.push(`存活人数从${prev}下降到${last}，策略在退步`);
+            }
+        }
+
+        // 资源趋势
+        for (const [resName, values] of Object.entries(trends)) {
+            if (resName === 'aliveCount' || values.length < 2) continue;
+            const last = values[values.length - 1];
+            const prev = values[values.length - 2];
+            if (last < prev * 0.5) {
+                failurePatterns.push(`${resName}连续下降(${Math.round(prev)}→${Math.round(last)})，需增加采集`);
+            } else if (last > prev * 1.5) {
+                successPatterns.push(`${resName}大幅提升(${Math.round(prev)}→${Math.round(last)})，采集策略有效`);
+            }
+        }
+
+        // 检测反复死亡模式
+        const deathCauseCounts = {};
+        const deathDayCounts = {};
+        for (const life of lives) {
+            for (const d of (life.deathRecords || [])) {
+                deathCauseCounts[d.cause] = (deathCauseCounts[d.cause] || 0) + 1;
+                const key = `day${d.day}_${d.cause}`;
+                deathDayCounts[key] = (deathDayCounts[key] || 0) + 1;
+            }
+        }
+        for (const [cause, count] of Object.entries(deathCauseCounts)) {
+            if (count >= lives.length) {
+                failurePatterns.push(`连续${count}世有人${cause}，该问题从未解决`);
+            }
+        }
+        for (const [key, count] of Object.entries(deathDayCounts)) {
+            if (count >= 2) {
+                failurePatterns.push(`连续多世在${key.replace('_', '天')}，需重点防范`);
+            }
+        }
+
+        // 检测成功世代的分配特征
+        for (const life of lives) {
+            if (life.aliveCount >= 7 && life.resourceSnapshot) {
+                const rs = life.resourceSnapshot;
+                if (rs.woodFuel > 50) successPatterns.push(`第${life.lifeNumber}世木柴充足(${Math.round(rs.woodFuel)})，砍柴策略可复用`);
+                if (life.secondFurnaceBuilt) successPatterns.push(`第${life.lifeNumber}世暖炉建成，建造时机可复用`);
+            }
+        }
+
+        return { successPatterns, failurePatterns, trends };
+    }
+
+    // ============ 【需求2】老钱指挥中心辅助方法 ============
+
+    /** 获取当前工作安排持有者（老钱→王策→李婶→凌玥） */
+    getWorkPlanHolder() {
+        const game = this.game;
+        const succession = ['old_qian', 'wang_teacher', 'li_shen', 'ling_yue'];
+        for (const id of succession) {
+            const npc = game.npcs.find(n => n.id === id && !n.isDead);
+            if (npc) return npc;
+        }
+        // 所有继任者都死了，返回任意存活NPC
+        return game.npcs.find(n => !n.isDead) || null;
+    }
+
+    /** 获取给特定NPC看的工作安排摘要 */
+    getWorkPlanSummaryForNpc(npcId) {
+        const holder = this.getWorkPlanHolder();
+        if (!holder || !holder.workPlan) return '';
+
+        const plan = holder.workPlan;
+        const day = this.game.dayCount || 1;
+        const dayPlan = plan.dayPlans[day];
+        if (!dayPlan) return '';
+
+        const nameMap = { zhao_chef: '赵铁柱', lu_chen: '陆辰', li_shen: '李婶', wang_teacher: '王策', old_qian: '老钱', su_doctor: '苏岩', ling_yue: '凌玥', qing_xuan: '清璇' };
+        const taskShort = { COLLECT_WOOD: '砍柴', COLLECT_FOOD: '采食物', COLLECT_MATERIAL: '采建材', MAINTAIN_POWER: '维护电力', COORDINATE: '统筹协调', PREPARE_MEDICAL: '医疗', SCOUT_RUINS: '侦察', CRAFT_MEDICINE: '制药', BOOST_MORALE: '鼓舞士气', BUILD_FURNACE: '建暖炉', MAINTAIN_FURNACE: '维护暖炉', MAINTAIN_ORDER: '维持秩序', DISTRIBUTE_FOOD: '分配食物', REPAIR_RADIO: '修无线电', REST_RECOVER: '休息' };
+
+        let summary = `【${nameMap[holder.id] || holder.name}的工作安排·第${day}天】\n`;
+        for (const assignment of dayPlan) {
+            const name = nameMap[assignment.npcId] || assignment.npcId;
+            const task = taskShort[assignment.task] || assignment.task;
+            const isMe = assignment.npcId === npcId;
+            summary += isMe ? `→★${name}:${task}(${assignment.reason})★\n` : `  ${name}:${task}\n`;
+        }
+        // 截断到200字符
+        if (summary.length > 200) summary = summary.substring(0, 197) + '…';
+        return summary;
+    }
+
+    /** 获取与特定NPC相关的教训 */
+    getLessonsForNpc(npcId) {
+        if (this.pastLives.length === 0) return '';
+        const lastLife = this.pastLives[this.pastLives.length - 1];
+        const deepLessons = this._generateDeepLessons(lastLife);
+
+        const npc = this.game.npcs.find(n => n.id === npcId);
+        if (!npc) return '';
+
+        // 筛选与该NPC相关的战术和执行层教训
+        const relevantLessons = [];
+        const npcName = npc.name;
+        for (const lesson of [...deepLessons.tactical, ...deepLessons.execution]) {
+            if (lesson.includes(npcName) || lesson.includes(npc.id)) {
+                relevantLessons.push(lesson);
+            }
+        }
+        // 也加入战略层前2条
+        relevantLessons.push(...deepLessons.strategic.slice(0, 2));
+
+        if (relevantLessons.length === 0) return '';
+        let text = relevantLessons.slice(0, 3).join('；');
+        if (text.length > 300) text = text.substring(0, 297) + '…';
+        return text;
+    }
+
     // ============ 序列化 ============
 
     serialize() {

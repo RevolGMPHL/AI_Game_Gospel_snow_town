@@ -1534,3 +1534,325 @@ canvas {
     margin-top: 4px;
     font-size: 12px;
 }
+
+/* ============ 往世结局弹窗 ============ */
+#past-lives-overlay {
+    position: fixed;
+    top: 0; left: 0; right: 0; bottom: 0;
+    background: rgba(0,0,0,0.7);
+    z-index: 9999;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    backdrop-filter: blur(4px);
+}
+
+#past-lives-panel {
+    background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%);
+    border: 1px solid rgba(100, 140, 255, 0.3);
+    border-radius: 16px;
+    width: 520px;
+    max-width: 90vw;
+    max-height: 80vh;
+    display: flex;
+    flex-direction: column;
+    box-shadow: 0 8px 32px rgba(0,0,0,0.5), 0 0 60px rgba(100,140,255,0.1);
+}
+
+.past-lives-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 16px 20px;
+    border-bottom: 1px solid rgba(100, 140, 255, 0.15);
+}
+
+.past-lives-title {
+    font-size: 16px;
+    font-weight: 700;
+    color: #c084fc;
+}
+
+.past-lives-close {
+    background: none;
+    border: 1px solid rgba(255,255,255,0.2);
+    color: #aaa;
+    font-size: 14px;
+    cursor: pointer;
+    border-radius: 50%;
+    width: 28px;
+    height: 28px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    transition: all 0.2s;
+}
+
+.past-lives-close:hover {
+    background: rgba(255,80,80,0.2);
+    color: #ff6b6b;
+    border-color: rgba(255,80,80,0.4);
+}
+
+.past-lives-body {
+    padding: 16px 20px;
+    overflow-y: auto;
+    flex: 1;
+}
+
+.past-life-card {
+    background: rgba(255,255,255,0.04);
+    border: 1px solid rgba(100,140,255,0.12);
+    border-radius: 12px;
+    padding: 14px 16px;
+    margin-bottom: 12px;
+    transition: all 0.2s;
+}
+
+.past-life-card:hover {
+    background: rgba(255,255,255,0.07);
+    border-color: rgba(100,140,255,0.25);
+}
+
+.past-life-card:last-child {
+    margin-bottom: 0;
+}
+
+.past-life-card-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    margin-bottom: 10px;
+}
+
+.past-life-num {
+    font-size: 15px;
+    font-weight: 700;
+    color: #c084fc;
+}
+
+.past-life-ending {
+    font-size: 12px;
+    padding: 3px 10px;
+    border-radius: 20px;
+    font-weight: 600;
+}
+
+.past-life-ending.perfect { background: rgba(74,222,128,0.15); color: #4ade80; border: 1px solid rgba(74,222,128,0.3); }
+.past-life-ending.normal { background: rgba(96,165,250,0.15); color: #60a5fa; border: 1px solid rgba(96,165,250,0.3); }
+.past-life-ending.bleak { background: rgba(251,191,36,0.15); color: #fbbf24; border: 1px solid rgba(251,191,36,0.3); }
+.past-life-ending.extinction { background: rgba(248,113,113,0.15); color: #f87171; border: 1px solid rgba(248,113,113,0.3); }
+.past-life-ending.unknown { background: rgba(160,160,160,0.15); color: #a0a0a0; border: 1px solid rgba(160,160,160,0.3); }
+
+.past-life-stats {
+    display: flex;
+    gap: 12px;
+    flex-wrap: wrap;
+    margin-bottom: 8px;
+}
+
+.past-life-stat {
+    font-size: 12px;
+    color: rgba(200,210,220,0.7);
+}
+
+.past-life-stat-val {
+    color: #e0e0e0;
+    font-weight: 600;
+}
+
+.past-life-deaths {
+    margin-top: 8px;
+    padding-top: 8px;
+    border-top: 1px solid rgba(255,255,255,0.06);
+}
+
+.past-life-death-item {
+    font-size: 11px;
+    color: rgba(248,113,113,0.8);
+    padding: 2px 0;
+}
+
+.past-life-death-item::before {
+    content: '💀 ';
+}
+
+.past-life-lessons {
+    margin-top: 8px;
+    padding-top: 8px;
+    border-top: 1px solid rgba(255,255,255,0.06);
+}
+
+.past-life-lesson-item {
+    font-size: 11px;
+    color: rgba(192,132,252,0.8);
+    padding: 2px 0;
+}
+
+.past-life-lesson-item::before {
+    content: '💡 ';
+}
+
+.past-life-current {
+    border-color: rgba(192,132,252,0.4);
+    background: rgba(192,132,252,0.06);
+}
+
+.past-lives-empty {
+    text-align: center;
+    color: rgba(200,210,220,0.4);
+    font-size: 13px;
+    padding: 40px 0;
+}
+
+.past-lives-empty-icon {
+    font-size: 40px;
+    display: block;
+    margin-bottom: 12px;
+}
+
+#surv-reincarnation:hover {
+    background: rgba(192,132,252,0.12);
+    border-radius: 6px;
+    transition: background 0.2s;
+}
+
+/* ====== 难度选择器 ====== */
+#difficulty-selector {
+    margin-top: 18px;
+    padding: 16px;
+    border-top: 1px solid rgba(255,255,255,0.08);
+    animation: fadeIn 0.3s ease;
+}
+
+.difficulty-title {
+    font-size: 15px;
+    font-weight: 600;
+    color: #c084fc;
+    text-align: center;
+    margin-bottom: 14px;
+}
+
+.difficulty-options {
+    display: flex;
+    flex-wrap: wrap;
+    justify-content: center;
+    gap: 10px;
+    margin-bottom: 10px;
+}
+
+.difficulty-option {
+    background: rgba(255,255,255,0.04);
+    border: 2px solid rgba(255,255,255,0.08);
+    border-radius: 10px;
+    padding: 12px 10px;
+    text-align: center;
+    cursor: pointer;
+    transition: all 0.2s ease;
+    position: relative;
+    overflow: hidden;
+    width: 130px;
+    flex-shrink: 0;
+}
+
+.difficulty-option:hover {
+    background: rgba(255,255,255,0.08);
+    border-color: rgba(192,132,252,0.3);
+    transform: scale(1.05);
+    box-shadow: 0 0 12px rgba(192,132,252,0.15);
+}
+
+.difficulty-option.selected {
+    background: rgba(192,132,252,0.12);
+    border-color: #c084fc;
+    box-shadow: 0 0 16px rgba(192,132,252,0.25), 0 0 30px rgba(192,132,252,0.1);
+}
+
+/* 锁定态卡片 */
+.difficulty-option.locked {
+    opacity: 0.35;
+    pointer-events: none;
+    filter: grayscale(0.3);
+}
+
+/* 锁定态中当前难度保持高亮 */
+.difficulty-option.locked.current-locked {
+    opacity: 0.85;
+    border-color: #c084fc;
+    background: rgba(192,132,252,0.1);
+}
+
+.difficulty-option.selected::after {
+    content: '✓';
+    position: absolute;
+    top: 4px;
+    right: 6px;
+    font-size: 11px;
+    color: #c084fc;
+    font-weight: bold;
+}
+
+.difficulty-stars {
+    font-size: 16px;
+    display: block;
+    margin-bottom: 4px;
+}
+
+.difficulty-name {
+    font-size: 14px;
+    font-weight: 700;
+    color: #fff;
+    margin-bottom: 3px;
+}
+
+.difficulty-desc {
+    font-size: 10px;
+    color: #8a8a9a;
+    line-height: 1.3;
+    margin-bottom: 4px;
+}
+
+.difficulty-lives {
+    font-size: 10px;
+    color: #c084fc;
+    opacity: 0.8;
+}
+
+/* 锁定提示文字 */
+.difficulty-locked-text {
+    text-align: center;
+    font-size: 12px;
+    color: #888;
+    margin-top: 4px;
+    padding: 4px 0;
+}
+
+/* 难度标签（顶部状态栏） */
+#surv-difficulty-label {
+    font-size: 10px;
+    color: #c084fc;
+    background: rgba(192,132,252,0.12);
+    padding: 1px 6px;
+    border-radius: 4px;
+    margin-left: 4px;
+    cursor: help;
+    position: relative;
+}
+
+#surv-difficulty-label:hover::after {
+    content: attr(data-tooltip);
+    position: absolute;
+    top: 100%;
+    left: 50%;
+    transform: translateX(-50%);
+    background: rgba(26,26,46,0.95);
+    border: 1px solid rgba(192,132,252,0.3);
+    border-radius: 6px;
+    padding: 6px 10px;
+    font-size: 11px;
+    color: #ccc;
+    white-space: nowrap;
+    z-index: 999;
+    margin-top: 4px;
+    pointer-events: none;
+}

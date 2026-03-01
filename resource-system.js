@@ -27,11 +27,14 @@ class ResourceSystem {
     constructor(game) {
         this.game = game;
 
-        // 四种核心资源池
-        this.woodFuel = RESOURCE_DEFAULTS.woodFuel;
-        this.food = RESOURCE_DEFAULTS.food;
-        this.power = RESOURCE_DEFAULTS.power;
-        this.material = RESOURCE_DEFAULTS.material;
+        // 四种核心资源池（应用难度系数）
+        const diff = (game && game.difficulty) ? game.difficulty : getDifficulty();
+        const initMult = diff.initialResources || { woodFuel: 1, food: 1, power: 1, material: 1 };
+        this.woodFuel = Math.round(RESOURCE_DEFAULTS.woodFuel * initMult.woodFuel);
+        this.food = Math.round(RESOURCE_DEFAULTS.food * initMult.food);
+        this.power = Math.round(RESOURCE_DEFAULTS.power * initMult.power);
+        this.material = Math.round(RESOURCE_DEFAULTS.material * initMult.material);
+        console.log(`[ResourceSystem] 难度=${diff.name}, 初始资源: 木柴${this.woodFuel} 食物${this.food} 电力${this.power} 建材${this.material}`);
 
         // 【轮回系统】难度微调：世数>=3 且上一世达成普通或更好结局时，初始资源略微降低
         if (game && game.reincarnationSystem) {
@@ -225,7 +228,10 @@ class ResourceSystem {
             const activeFurnaces = furnaceSystem.getActiveFurnaceCount();
             if (activeFurnaces > 0) {
                 const baseWood = RESOURCE_CONSUMPTION.woodPerFurnacePerHour * activeFurnaces * hourFraction;
-                let woodNeeded = baseWood * weatherMult.wood;
+                // 【难度系统】木柴消耗乘以难度倍率
+                const diffConsWood = this.game.getDifficultyMult ? this.game.getDifficultyMult('consumptionMult') : null;
+                const diffWoodMult = (diffConsWood && diffConsWood.wood) ? diffConsWood.wood : 1.0;
+                let woodNeeded = baseWood * weatherMult.wood * diffWoodMult;
 
                 // 【燃料节约】有NPC在维护暖炉时，木柴消耗减少10%
                 if (this.game._furnaceFuelSaving) {
@@ -250,7 +256,10 @@ class ResourceSystem {
 
         // 2) 发电机消耗电力，应用天气乘数
         const basePower = RESOURCE_CONSUMPTION.powerPerHour * hourFraction;
-        const powerNeeded = basePower * weatherMult.power;
+        // 【难度系统】电力消耗乘以难度倍率
+        const diffConsPower = this.game.getDifficultyMult ? this.game.getDifficultyMult('consumptionMult') : null;
+        const diffPowerMult = (diffConsPower && diffConsPower.power) ? diffConsPower.power : 1.0;
+        const powerNeeded = basePower * weatherMult.power * diffPowerMult;
         this.consumeResource('power', powerNeeded, '发电机');
     }
 
@@ -353,6 +362,11 @@ class ResourceSystem {
         // 计算需要的食物
         const aliveNPCs = this.game.npcs.filter(n => !n.isDead);
         let totalNeeded = aliveNPCs.length * RESOURCE_CONSUMPTION.foodPerMealPerPerson;
+
+        // 【难度系统】食物消耗乘以难度倍率
+        const diffConsFood = this.game.getDifficultyMult ? this.game.getDifficultyMult('consumptionMult') : null;
+        const diffFoodMult = (diffConsFood && diffConsFood.food) ? diffConsFood.food : 1.0;
+        totalNeeded *= diffFoodMult;
 
         // 【任务7】食物浪费减少：有人管理仓库/做饭时消耗量×0.8
         if (this.game._foodWasteReduction) {

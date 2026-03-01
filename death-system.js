@@ -300,6 +300,26 @@ class DeathSystem {
         // 触发死亡连锁反应
         this._triggerDeathChainReaction(npc, cause);
 
+        // 【智能分工系统】workPlan持有者死亡时转移 + 任务重分配
+        this._handleWorkPlanTransfer(npc);
+        if (this.game.taskSystem && this.game.taskSystem.reassignDeadNpcTasks) {
+            this.game.taskSystem.reassignDeadNpcTasks(npc.id);
+        }
+
+        // 【事件驱动镜头】通知镜头系统：NPC死亡
+        if (this.game.onNPCEvent) {
+            this.game.onNPCEvent(npc, 'death');
+        }
+
+        // 【镜头切走】若当前跟随目标就是死亡NPC，3秒后自动切到其他存活NPC
+        if (this.game.followTarget === npc && this.game.autoFollow) {
+            const aliveCount = this.game.npcs.filter(n => !n.isDead).length;
+            if (aliveCount > 0) {
+                this.game._deathViewTimer = 3; // 3秒后由 update() 中的计时器触发 _autoSwitchFollow()
+            }
+            // 全灭时不触发切换，保持镜头在最后死亡位置
+        }
+
         // 检查是否全灭
         this._checkExtinction();
     }
@@ -1138,6 +1158,43 @@ class DeathSystem {
         if (alive >= 5) return ENDINGS.NORMAL;
         if (alive >= 2) return ENDINGS.BLEAK;
         return ENDINGS.EXTINCTION;
+    }
+
+    // ============ 【智能分工系统】workPlan转移 ============
+
+    /** 当workPlan持有者死亡时，将workPlan转移给下一个继任者 */
+    _handleWorkPlanTransfer(deadNpc) {
+        if (!deadNpc.workPlan) return; // 死者不是workPlan持有者
+
+        const rs = this.game.reincarnationSystem;
+        if (!rs) return;
+
+        // 找到下一个继任者
+        const succession = ['old_qian', 'wang_teacher', 'li_shen', 'ling_yue'];
+        let newHolder = null;
+        for (const id of succession) {
+            if (id === deadNpc.id) continue; // 跳过死者自己
+            const npc = this.game.npcs.find(n => n.id === id && !n.isDead);
+            if (npc) {
+                newHolder = npc;
+                break;
+            }
+        }
+
+        // 如果所有继任者都死了，找任意存活NPC
+        if (!newHolder) {
+            newHolder = this.game.npcs.find(n => !n.isDead && n.id !== deadNpc.id);
+        }
+
+        if (newHolder) {
+            newHolder.workPlan = deadNpc.workPlan;
+            deadNpc.workPlan = null;
+
+            if (this.game.addEvent) {
+                this.game.addEvent(`📋 ${deadNpc.name}已故，工作安排表由${newHolder.name}接管`);
+            }
+            console.log(`[WorkPlan] ${deadNpc.name}死亡，workPlan转移给${newHolder.name}`);
+        }
     }
 
     // ============ 序列化 ============

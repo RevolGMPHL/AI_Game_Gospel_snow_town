@@ -7,8 +7,8 @@
 // ============ LLM API 配置 ============
 // --- Ollama 本地模式（免费，需先运行 ollama serve）---
 const API_KEY = '';  // Ollama 不需要 API Key
-const API_URL = 'http://localhost:11434/v1/chat/completions';  // Ollama OpenAI 兼容接口（云端GLM-4用）
-const OLLAMA_NATIVE_URL = 'http://localhost:11434/api/chat';    // Ollama 原生接口（本地模型用，支持关闭think）
+const API_URL = '/ollama/v1/chat/completions';  // Ollama OpenAI 兼容接口（云端GLM-4用）
+const OLLAMA_NATIVE_URL = '/ollama/api/chat';    // Ollama 原生接口（本地模型用，支持关闭think）
 const USE_OLLAMA_NATIVE = true;  // 使用Ollama原生接口（解决Qwen3思考模式导致content为空的问题）
 let AI_MODEL = 'qwen3:14b-q8_0';  // Qwen3-14B Q8量化 本地模型（启动界面可选）
 // --- 如需切回 GLM-4 云端，取消下面注释 ---
@@ -324,6 +324,10 @@ class Game {
         // 轮回模式继承AI观察模式的全部行为（自动跟随、NPC自主行动等）
         this.isAgentMode = (mode === 'agent' || mode === 'reincarnation');
 
+        // 【难度系统】读取当前难度配置
+        this.difficulty = getDifficulty();
+        console.log(`[Game] 难度: ${this.difficulty.stars} ${this.difficulty.name} (key=${this.difficulty.key})`);
+
         this.canvas = document.getElementById('gameCanvas');
         this.ctx = this.canvas.getContext('2d');
         this.ui = document.getElementById('ui');
@@ -351,6 +355,10 @@ class Game {
         // 速度档位
         this.speedOptions = [1, 2, 5, 10];
         this.speedIdx = 0;
+
+        // 全员入睡跳夜系统
+        this._nightSkipDone = false; // 当天是否已执行过跳夜（每天只跳一次）
+        this._allSleepingFrames = 0; // 连续多少帧全员在睡觉（防抖动）
 
         // 天气系统
         this.weather = '晴天';
@@ -395,6 +403,9 @@ class Game {
         // 轮回记忆系统（非轮回模式下构造函数内部自动强制第1世）
         this.reincarnationSystem = (typeof ReincarnationSystem !== 'undefined') ? new ReincarnationSystem(this) : null;
 
+        // 【智能分工系统】生成workPlan并存储到老钱
+        this._initWorkPlan();
+
         // AI模式日志系统（仅 agent/reincarnation 模式下启用）
         this.aiModeLogger = (this.isAgentMode && typeof AIModeLogger !== 'undefined') ? new AIModeLogger(this) : null;
 
@@ -419,7 +430,13 @@ class Game {
         this.followTarget = null;    // 当前跟随的 NPC
         this.autoFollow = true;      // 自动切换跟随
         this.followSwitchTimer = 0;
-        this.followSwitchInterval = 20; // 每 20 秒自动切换一次
+        this.followSwitchInterval = 30; // 每 30 秒兜底自动切换一次
+
+        // ---- 事件驱动镜头切换 ----
+        this._cameraLockTimer = 0;       // 事件锁定倒计时（秒），>0 时不响应低优先级切换
+        this._cameraLockDuration = 5;    // 事件驱动切换后的锁定观看时长（秒）
+        this._cameraLockPriority = 0;    // 当前锁定事件的优先级（0=无锁定）
+        this._deathViewTimer = 0;        // 当前跟随目标死亡后延迟切走计时器
 
         // ---- Debug 模式 ----
         this.debugCamSpeed = 300;
@@ -434,9 +451,15 @@ class Game {
         this.nextScene = null;
         this.pendingFollowTarget = null;
 
-        // 事件日志
+// 事件日志
         this.eventLog = [];
         this.maxEventLog = 50;
+
+        // 补发 _initWorkPlan 延迟的事件（因为 eventLog 在其之后才初始化）
+        if (this._pendingWorkPlanEvent) {
+            this.addEvent(this._pendingWorkPlanEvent);
+            delete this._pendingWorkPlanEvent;
+        }
 
         // 设置输入
         this._setupInput();
@@ -464,6 +487,41 @@ class Game {
         this._updateReincarnationUI();
 
 console.log(`🏘️ 福音镇已启动！模式: ${mode}`);
+    }
+
+    /**
+     * 【难度系统】获取指定参数的难度倍率
+     * @param {string} paramName - 参数名（如 'hungerDecayMult', 'staminaDrainMult' 等）
+     * @returns {number} 对应的倍率值，默认返回 1.0
+     */
+    getDifficultyMult(paramName) {
+        return (this.difficulty && this.difficulty[paramName] != null) ? this.difficulty[paramName] : 1.0;
+    }
+
+    // ---- 【智能分工系统】workPlan初始化 ----
+    _initWorkPlan() {
+        if (!this.reincarnationSystem) return;
+
+        // 生成分工方案
+        const workPlan = this.reincarnationSystem.generateWorkPlan();
+        if (!workPlan) return;
+
+        // 存储到老钱（或继任者）
+        const holder = this.reincarnationSystem.getWorkPlanHolder();
+        if (holder) {
+            holder.workPlan = workPlan;
+            const lifeNum = this.reincarnationSystem.getLifeNumber();
+            console.log(`[WorkPlan] 第${lifeNum}世分工方案已存储到${holder.name}`);
+            // 延迟添加事件，因为构造函数中 eventLog 可能尚未初始化
+            this._pendingWorkPlanEvent = `📋 ${holder.name}制定了第${lifeNum}世分工方案: ${workPlan.workPlanSummary}`;
+        }
+
+        // 日志输出
+        if (workPlan.dayPlans) {
+            const days = Object.keys(workPlan.dayPlans);
+            const npcCounts = days.map(d => workPlan.dayPlans[d].length);
+            console.log(`[WorkPlan] 第${this.reincarnationSystem.getLifeNumber()}世分工方案生成完毕: { ${days.map((d, i) => `day${d}: ${npcCounts[i]}人`).join(', ')} }`);
+        }
     }
 
     // ---- NPC 初始化 ----
@@ -546,8 +604,16 @@ console.log(`🏘️ 福音镇已启动！模式: ${mode}`);
         btnSpeed.addEventListener('click', () => this.cycleSpeed());
         btnFollow.addEventListener('click', () => {
             this.autoFollow = !this.autoFollow;
-            btnFollow.classList.toggle('active', this.autoFollow);
-            btnFollow.textContent = this.autoFollow ? '📷 跟随' : '📷 自由';
+            btnFollow.classList.toggle('active', !this.autoFollow);
+            btnFollow.textContent = this.autoFollow ? '📷 自由' : '📷 跟随';
+            // 无论切到哪个模式，都清除事件锁定状态
+            this._cameraLockTimer = 0;
+            this._cameraLockPriority = 0;
+            if (this.autoFollow) {
+                // 切到自由模式：立即触发一次自动切换，避免镜头卡住不动
+                this.followSwitchTimer = 0;
+                this._autoSwitchFollow();
+            }
         });
 
         // 填充 NPC 选择
@@ -561,8 +627,11 @@ console.log(`🏘️ 福音镇已启动！模式: ${mode}`);
             const val = selTarget.value;
             if (val === 'auto') {
                 this.autoFollow = true;
-                btnFollow.classList.add('active');
-                btnFollow.textContent = '📷 跟随';
+                btnFollow.classList.remove('active');
+                btnFollow.textContent = '📷 自由';
+                // 立即触发一次自动切换
+                this.followSwitchTimer = 0;
+                this._autoSwitchFollow();
             } else {
                 const npc = this.npcs.find(n => n.id === val);
                 if (npc) this.setFollowTarget(npc);
@@ -1342,12 +1411,15 @@ const resp = await fetch('http://localhost:8080/api/save-debug-log', {
         this.followTarget = npc;
         this.autoFollow = false;
         this.followSwitchTimer = 0;
+        // 清除事件驱动锁定
+        this._cameraLockTimer = 0;
+        this._cameraLockPriority = 0;
 
-        // 更新 UI
+        // 更新 UI — 切到跟随模式（锁定该角色）
         const btnFollow = document.getElementById('btn-follow');
         if (btnFollow) {
-            btnFollow.classList.remove('active');
-            btnFollow.textContent = '📷 自由';
+            btnFollow.classList.add('active');
+            btnFollow.textContent = '📷 跟随';
         }
         const sel = document.getElementById('sel-follow-target');
         if (sel) sel.value = npc.id;
@@ -1727,31 +1799,105 @@ const visibleNPCs = this.npcs.filter(n => n.currentScene === this.currentScene &
     _autoSwitchFollow() {
         if (!this.autoFollow || this.npcs.length === 0) return;
 
-        // 优先跟随正在说话/做有趣事的 NPC
-        const chatting = this.npcs.filter(n => n.state === 'CHATTING');
+        // 过滤掉已死亡的 NPC
+        const alive = this.npcs.filter(n => !n.isDead);
+        if (alive.length === 0) return; // 所有NPC都死了，保持当前镜头
+
+        // 优先级1：正在对话的 NPC（排除当前目标）
+        const chatting = alive.filter(n => n.state === 'CHATTING' && n !== this.followTarget);
         if (chatting.length > 0) {
             const pick = chatting[Math.floor(Math.random() * chatting.length)];
-            if (pick !== this.followTarget) {
-                this.followTarget = pick;
-                if (pick.currentScene !== this.currentScene) {
-                    this._switchScene(pick.currentScene, pick);
-                }
-                this.addEvent(`📷 自动切换到 ${pick.name}（正在对话）`);
-                return;
-            }
+            this._doAutoSwitch(pick, '正在对话');
+            return;
         }
 
-        // 随机切换到一个正在行走的 NPC
-        const walking = this.npcs.filter(n => n.isMoving && n !== this.followTarget);
-        const pool = walking.length > 0 ? walking : this.npcs.filter(n => n !== this.followTarget);
-        if (pool.length > 0) {
-            const pick = pool[Math.floor(Math.random() * pool.length)];
-            this.followTarget = pick;
-            if (pick.currentScene !== this.currentScene) {
-                this._switchScene(pick.currentScene, pick);
-            }
-            this.addEvent(`📷 自动切换到 ${pick.name}`);
+        // 优先级2：正在移动的 NPC（排除当前目标）
+        const walking = alive.filter(n => n.isMoving && n !== this.followTarget);
+        if (walking.length > 0) {
+            const pick = walking[Math.floor(Math.random() * walking.length)];
+            this._doAutoSwitch(pick, '正在移动');
+            return;
         }
+
+        // 优先级3：任意存活的其他 NPC
+        const others = alive.filter(n => n !== this.followTarget);
+        if (others.length > 0) {
+            const pick = others[Math.floor(Math.random() * others.length)];
+            this._doAutoSwitch(pick);
+        }
+        // 如果只剩当前跟随的NPC存活，则保持不动
+    }
+
+    /** 自动切换辅助：执行切换并同步UI */
+    _doAutoSwitch(npc, reason) {
+        this.followTarget = npc;
+        if (npc.currentScene !== this.currentScene) {
+            this._switchScene(npc.currentScene, npc);
+        }
+        const label = reason ? `（${reason}）` : '';
+        this.addEvent(`📷 自动切换到 ${npc.name}${label}`);
+        // 同步下拉选择器显示当前NPC
+        const sel = document.getElementById('sel-follow-target');
+        if (sel) sel.value = npc.id;
+    }
+
+    // ---- 事件驱动镜头切换 ----
+    /** 事件优先级映射 */
+    static get CAMERA_EVENT_PRIORITY() {
+        return { chat_start: 1, crazy: 2, death: 3 };
+    }
+
+    /**
+     * NPC 重大事件通知 —— 由外部（dialogue.js / npc.js / death-system.js）调用
+     * @param {NPC} npc - 触发事件的 NPC
+     * @param {'chat_start'|'crazy'|'death'} eventType - 事件类型
+     */
+    onNPCEvent(npc, eventType) {
+        // 仅在自由模式下生效
+        if (!this.autoFollow) return;
+        if (!npc) return;
+
+        const priority = Game.CAMERA_EVENT_PRIORITY[eventType] || 0;
+
+        // 如果当前有锁定且新事件优先级不高于当前锁定，忽略
+        if (this._cameraLockTimer > 0 && priority <= this._cameraLockPriority) return;
+
+        // 执行事件驱动切换
+        this._eventDrivenSwitch(npc, eventType);
+
+        // 设置锁定
+        this._cameraLockTimer = this._cameraLockDuration;
+        this._cameraLockPriority = priority;
+
+        // 重置兜底轮询计时器，避免刚切过去又被轮询切走
+        this.followSwitchTimer = 0;
+    }
+
+    /**
+     * 事件驱动切换：立即将镜头切到指定 NPC
+     * @param {NPC} npc - 目标 NPC
+     * @param {string} eventType - 事件类型
+     */
+    _eventDrivenSwitch(npc, eventType) {
+        this.followTarget = npc;
+
+        // 跨场景切换
+        if (npc.currentScene !== this.currentScene) {
+            this._switchScene(npc.currentScene, npc);
+        }
+
+        // 事件日志（区分类型）
+        const eventLabels = {
+            chat_start: '开始对话',
+            crazy: '发疯了！',
+            death: '死亡'
+        };
+        const label = eventLabels[eventType] || eventType;
+        this.addEvent(`📷 紧急切换到 ${npc.name}（${label}）`);
+
+        // 同步下拉选择器
+        const sel = document.getElementById('sel-follow-target');
+        if (sel) sel.value = npc.id;
     }
 
     _switchScene(scene, npc) {
@@ -1792,6 +1938,7 @@ const visibleNPCs = this.npcs.filter(n => n.currentScene === this.currentScene &
         if (this.gameTimeSeconds >= 24 * 3600) {
             this.gameTimeSeconds -= 24 * 3600;
             this.dayCount++;
+            this._nightSkipDone = false; // 新的一天重置跳夜标志
             this.addEvent(`🌅 新的一天！第 ${this.dayCount} 天`);
             // 重置所有NPC的每日客流统计和饥饿值
             for (const npc of this.npcs) {
@@ -1916,6 +2063,9 @@ const visibleNPCs = this.npcs.filter(n => n.currentScene === this.currentScene &
         // NPC 之间碰撞推挤 —— 防止重叠站在一起
         this._resolveNPCCollisions();
 
+        // ============ 全员入睡跳夜检测（必须在NPC update之后，确保isSleeping状态是最新的） ============
+        this._checkNightSkip();
+
         // 对话更新
         this.dialogueManager.update(dt);
 
@@ -1923,8 +2073,28 @@ const visibleNPCs = this.npcs.filter(n => n.currentScene === this.currentScene &
         const map = this.maps[this.currentScene];
         if (this.isAgentMode) {
             // AI/轮回 模式：自动跟随
+
+            // 事件驱动锁定计时器递减
+            if (this._cameraLockTimer > 0) {
+                this._cameraLockTimer -= dt;
+                if (this._cameraLockTimer <= 0) {
+                    this._cameraLockTimer = 0;
+                    this._cameraLockPriority = 0;
+                }
+            }
+
+            // 死亡延迟切走计时器
+            if (this._deathViewTimer > 0) {
+                this._deathViewTimer -= dt;
+                if (this._deathViewTimer <= 0) {
+                    this._deathViewTimer = 0;
+                    this._autoSwitchFollow();
+                }
+            }
+
+            // 兜底轮询：锁定期间不触发
             this.followSwitchTimer += dt;
-            if (this.followSwitchTimer >= this.followSwitchInterval && this.autoFollow) {
+            if (this.followSwitchTimer >= this.followSwitchInterval && this.autoFollow && this._cameraLockTimer <= 0) {
                 this.followSwitchTimer = 0;
                 this._autoSwitchFollow();
             }
@@ -1964,6 +2134,177 @@ const visibleNPCs = this.npcs.filter(n => n.currentScene === this.currentScene &
             this.weather = this.weatherSystem.currentWeather;
             this._updateRainIntensity();
         }
+    }
+
+    /**
+     * 全员入睡跳夜机制：所有存活NPC都在睡觉时，直接跳到早6点
+     * - 仅在深夜时段（22:00~05:59）生效
+     * - 每天只触发一次，防止反复跳
+     * - 跳过期间补算NPC的体力/San值/体温恢复
+     * - 正确处理跨午夜日切换
+     */
+    _checkNightSkip() {
+        // 已经跳过了今晚，不再重复
+        if (this._nightSkipDone) return;
+
+        const hour = this.getHour();
+        // 放宽检测时段：20:00~05:59（NPC可能因体力不支在20点就开始强制入睡）
+        const isNightTime = hour >= 20 || hour < 6;
+        if (!isNightTime) {
+            this._allSleepingFrames = 0; // 非夜间重置计数
+            return;
+        }
+
+        // 检测所有存活NPC是否都在睡觉
+        const aliveNpcs = this.npcs.filter(n => !n.isDead);
+        if (aliveNpcs.length === 0) return; // 无存活NPC不跳
+        
+        // 允许 isSleeping=true 或者 state==='SLEEPING' 都算在睡觉
+        const allSleeping = aliveNpcs.every(n => n.isSleeping || n.state === 'SLEEPING');
+        
+        // 调试日志：每5秒打印一次跳夜检测状态
+        if (!this._lastNightSkipLog || Date.now() - this._lastNightSkipLog > 5000) {
+            this._lastNightSkipLog = Date.now();
+            const statusList = aliveNpcs.map(n => `${n.name}:sleeping=${n.isSleeping},state=${n.state},scene=${n.currentScene}`).join(' | ');
+            console.log(`[跳夜检测] hour=${hour} allSleeping=${allSleeping} frames=${this._allSleepingFrames} alive=${aliveNpcs.length} | ${statusList}`);
+        }
+        
+        if (!allSleeping) {
+            this._allSleepingFrames = 0; // 有人醒着，重置计数
+            return;
+        }
+
+        // 防抖动：需要连续多帧（约0.5秒，30帧@60fps）全员在睡才触发跳夜
+        // 这样即使有NPC被短暂饿醒又重新入睡，也不会阻止跳夜
+        this._allSleepingFrames = (this._allSleepingFrames || 0) + 1;
+        if (this._allSleepingFrames < 30) return; // 等待约0.5秒稳定
+
+        // ✅ 全员入睡持续稳定 → 执行跳夜
+        this._nightSkipDone = true;
+        this._allSleepingFrames = 0;
+
+        // 计算需要跳过的游戏秒数（跳到早6点=21600秒）
+        const targetSeconds = 6 * 3600; // 06:00
+        const currentSeconds = this.gameTimeSeconds;
+        let skipSeconds;
+        if (currentSeconds >= 20 * 3600) {
+            // 20:00~23:59 → 需要跨午夜：先到24:00再到06:00
+            skipSeconds = (24 * 3600 - currentSeconds) + targetSeconds;
+        } else {
+            // 00:00~05:59 → 直接跳到06:00
+            skipSeconds = targetSeconds - currentSeconds;
+        }
+
+        if (skipSeconds <= 0) return; // 安全保护
+
+        const skipHours = skipSeconds / 3600;
+        console.log(`[跳夜] 全员入睡！从 ${this.getTimeStr()} 跳到 06:00（跳过 ${skipHours.toFixed(1)} 小时）`);
+
+        // 1. 补算NPC睡眠恢复（按跳过的时间量）
+        for (const npc of aliveNpcs) {
+            // 体力恢复：睡眠中每游戏小时恢复约8点（正常tick中是 0.002*dt*60≈0.12/s → 7.2/h）
+            const staminaGain = skipHours * 8;
+            npc.stamina = Math.min(100, npc.stamina + staminaGain);
+
+            // San值恢复：睡眠中每游戏小时恢复约3点
+            const sanityGain = skipHours * 3;
+            npc.sanity = Math.min(100, npc.sanity + sanityGain);
+
+            // 健康恢复：睡眠中每游戏小时恢复约1点
+            const healthGain = skipHours * 1;
+            npc.health = Math.min(100, npc.health + healthGain);
+
+            // 体温：如果在室内睡觉，体温缓慢回升到36度
+            if (npc.bodyTemp !== undefined && npc.bodyTemp < 36) {
+                npc.bodyTemp = Math.min(36, npc.bodyTemp + skipHours * 0.5);
+            }
+
+            // 清除强制睡眠标记（跳夜后相当于睡够了）
+            if (npc._forcedSleep) {
+                npc._forcedSleep = false;
+                npc._forcedSleepTimer = 0;
+            }
+        }
+
+        // 2. 处理跨午夜日切换
+        const needDayChange = currentSeconds >= 20 * 3600; // 20点以后需要跨日
+        if (needDayChange) {
+            // 先推进到午夜，触发日切换
+            this.gameTimeSeconds = 24 * 3600; // 会在下一帧的时间流逝中触发日切换
+            // 手动触发日切换逻辑（因为我们直接设置时间，不经过正常tick）
+            this.gameTimeSeconds = 0; // 重置为0:00
+            this.dayCount++;
+            this._nightSkipDone = false; // 新的一天，但立刻会再设为true
+            this._nightSkipDone = true;  // 防止新的一天0:00再次触发跳夜检测
+
+            // 触发跨过的每个小时的天气变化
+            for (let h = hour + 1; h <= 23; h++) {
+                this._onHourChange(h);
+            }
+            for (let h = 0; h <= 6; h++) {
+                this._onHourChange(h);
+            }
+
+            // 日切换时的NPC属性处理（简化版，避免重复完整日切换逻辑）
+            for (const npc of this.npcs) {
+                npc._dayChangeWhileSleeping = true;
+                npc.shopVisitorCount = 0;
+                npc.shopLastVisitorTime = null;
+                npc.shopAloneMinutes = 0;
+                npc.hunger = Math.max(npc.hunger, 80);
+                npc.isEating = false;
+                npc._hungerOverride = false;
+                npc._hungerTarget = null;
+            }
+
+            // 通知各子系统
+            if (this.weatherSystem && this.weatherSystem.onDayChange) {
+                this.weatherSystem.onDayChange(this.dayCount);
+            }
+            if (this.resourceSystem && this.resourceSystem.generateDayReport) {
+                const report = this.resourceSystem.generateDayReport(this.dayCount - 1);
+                if (report) {
+                    console.log('[Game] 跳夜日结算报告:', this.resourceSystem.formatDayReport(report));
+                }
+            }
+            if (this.furnaceSystem && this.furnaceSystem.onDayChange) {
+                this.furnaceSystem.onDayChange(this.dayCount);
+            }
+            if (this.taskSystem && this.taskSystem.onDayChange) {
+                this.taskSystem.onDayChange(this.dayCount);
+            }
+            if (this.deathSystem && this.deathSystem.addMilestone) {
+                this.deathSystem.addMilestone(`🌅 第${this.dayCount}天开始（跳夜）`);
+            }
+
+            this.addEvent(`🌅 新的一天！第 ${this.dayCount} 天`);
+        } else {
+            // 不跨日（0~5点），只需补触发跳过的小时
+            for (let h = hour + 1; h <= 6; h++) {
+                this._onHourChange(h);
+            }
+        }
+
+        // 3. 补算资源消耗（木柴+电力在跳过期间仍然需要持续消耗）
+        if (this.resourceSystem) {
+            const rs = this.resourceSystem;
+            // 模拟跳过时段的资源消耗（传入跳过的总秒数）
+            rs._tickConsumption(skipSeconds);
+            console.log(`[跳夜] 资源补算: 木柴=${rs.woodFuel.toFixed(1)} 电力=${rs.power.toFixed(1)} (消耗${skipHours.toFixed(1)}小时)`);
+        }
+
+        // 4. 设置最终时间为06:00
+        this.gameTimeSeconds = targetSeconds;
+
+        // 5. 添加UI事件通知
+        this.addEvent(`🌙💤 全员入睡，夜间快进到早上 06:00`);
+
+        // AI模式日志
+        if (this.aiModeLogger) {
+            this.aiModeLogger.log('NIGHT_SKIP', `全员入睡跳夜 → 06:00 | 跳过${skipHours.toFixed(1)}小时 | 第${this.dayCount}天`);
+        }
+
+        console.log(`[跳夜] 完成！当前时间: ${this.getTimeStr()} 第${this.dayCount}天`);
     }
 
     _updateRainIntensity() {
@@ -2461,6 +2802,9 @@ const visibleNPCs = this.npcs.filter(n => n.currentScene === this.currentScene &
             }
         }
 
+        // 9.5 【智能分工系统】轮回后重新生成workPlan
+        this._initWorkPlan();
+
         // 10. 重新设置对话管理器的game引用
         if (this.dialogueManager) {
             this.dialogueManager.game = this;
@@ -2522,8 +2866,8 @@ const visibleNPCs = this.npcs.filter(n => n.currentScene === this.currentScene &
         if (btnSpeed) btnSpeed.textContent = '1×';
         const btnFollow = document.getElementById('btn-follow');
         if (btnFollow) {
-            btnFollow.classList.add('active');
-            btnFollow.textContent = '📷 跟随';
+            btnFollow.classList.remove('active');
+            btnFollow.textContent = '📷 自由';
         }
 
         // 16. 更新轮回世数显示
@@ -2555,9 +2899,160 @@ const visibleNPCs = this.npcs.filter(n => n.currentScene === this.currentScene &
             const valEl = document.getElementById('surv-reincarnation-val');
             const lifeNum = this.reincarnationSystem.getLifeNumber();
             if (valEl) valEl.textContent = `第${lifeNum}世`;
+
+            // 绑定点击事件（只绑一次）
+            if (!el._pastLivesClickBound) {
+                el._pastLivesClickBound = true;
+                el.addEventListener('click', () => this._showPastLivesPanel());
+            }
         } else {
             el.style.display = 'none';
         }
+
+        // 【难度系统】更新难度状态栏显示
+        const diffEl = document.getElementById('surv-difficulty');
+        if (diffEl) {
+            if (this.mode === 'reincarnation' && this.difficulty) {
+                diffEl.style.display = '';
+                const diffValEl = document.getElementById('surv-difficulty-val');
+                if (diffValEl) {
+                    diffValEl.textContent = `${this.difficulty.stars} ${this.difficulty.name}`;
+                }
+                // 悬停提示显示核心倍率参数
+                const d = this.difficulty;
+                diffEl.title = `难度: ${d.stars} ${d.name}\n` +
+                    `消耗倍率: 木柴×${d.consumptionMult.wood} 电力×${d.consumptionMult.power} 食物×${d.consumptionMult.food}\n` +
+                    `初始资源: ×${d.initialResources.woodFuel}\n` +
+                    `采集效率: ×${d.gatherEfficiencyMult}\n` +
+                    `属性衰减: 饱腹×${d.hungerDecayMult} 体力×${d.staminaDrainMult} San×${d.sanDecayMult}\n` +
+                    `温度偏移: -${d.tempOffset}°C\n` +
+                    `轮回Buff: ×${d.reincarnationBuffMult}`;
+            } else {
+                diffEl.style.display = 'none';
+            }
+        }
+    }
+
+    /** 显示往世结局弹窗 */
+    _showPastLivesPanel() {
+        const overlay = document.getElementById('past-lives-overlay');
+        const body = document.getElementById('past-lives-body');
+        const closeBtn = document.getElementById('past-lives-close');
+        if (!overlay || !body) return;
+
+        const rs = this.reincarnationSystem;
+        if (!rs) return;
+
+        const pastLives = rs.pastLives || [];
+        const currentLife = rs.getLifeNumber();
+
+        // 结局类型映射
+        const endingMap = {
+            perfect: { text: '✨ 完美结局', cls: 'perfect' },
+            normal:  { text: '😌 普通结局', cls: 'normal' },
+            bleak:   { text: '😰 惨淡结局', cls: 'bleak' },
+            extinction: { text: '💀 全灭结局', cls: 'extinction' },
+            unknown: { text: '❓ 未知', cls: 'unknown' },
+        };
+
+        let html = '';
+
+        if (pastLives.length === 0) {
+            html = `
+                <div class="past-lives-empty">
+                    <span class="past-lives-empty-icon">📜</span>
+                    这是第一世，还没有往世记录。<br>
+                    <span style="font-size:11px; opacity:0.6; margin-top:8px; display:inline-block;">
+                        当这一世结束后，结局会被记录在这里
+                    </span>
+                </div>
+            `;
+        } else {
+            // 从最近的世代开始显示
+            for (let i = pastLives.length - 1; i >= 0; i--) {
+                const life = pastLives[i];
+                const ending = endingMap[life.endingType] || endingMap.unknown;
+                const lifeNum = life.lifeNumber || (i + 1);
+
+                // 存活统计
+                const aliveCount = life.aliveCount || 0;
+                const deadCount = life.deadCount || (8 - aliveCount);
+
+                // 资源快照
+                const res = life.resourceSnapshot;
+                let resHtml = '';
+                if (res) {
+                    resHtml = `
+                        <div class="past-life-stats">
+                            <span class="past-life-stat">🪵 <span class="past-life-stat-val">${res.woodFuel}</span></span>
+                            <span class="past-life-stat">🍞 <span class="past-life-stat-val">${res.food}</span></span>
+                            <span class="past-life-stat">⚡ <span class="past-life-stat-val">${res.power}</span></span>
+                            <span class="past-life-stat">🧱 <span class="past-life-stat-val">${res.material}</span></span>
+                            <span class="past-life-stat">🔥 第二暖炉 <span class="past-life-stat-val">${life.secondFurnaceBuilt ? '✅' : '❌'}</span></span>
+                        </div>
+                    `;
+                }
+
+                // 死亡记录
+                let deathHtml = '';
+                if (life.deathRecords && life.deathRecords.length > 0) {
+                    deathHtml = '<div class="past-life-deaths">';
+                    for (const d of life.deathRecords) {
+                        deathHtml += `<div class="past-life-death-item">${d.name} — 第${d.day}天${d.time || ''} ${d.cause}${d.location ? '（' + d.location + '）' : ''}</div>`;
+                    }
+                    deathHtml += '</div>';
+                }
+
+                // 教训
+                let lessonHtml = '';
+                if (life.lessons && life.lessons.length > 0) {
+                    lessonHtml = '<div class="past-life-lessons">';
+                    for (const l of life.lessons) {
+                        lessonHtml += `<div class="past-life-lesson-item">${l}</div>`;
+                    }
+                    lessonHtml += '</div>';
+                }
+
+                html += `
+                    <div class="past-life-card">
+                        <div class="past-life-card-header">
+                            <span class="past-life-num">🔄 第${lifeNum}世</span>
+                            <span class="past-life-ending ${ending.cls}">${ending.text}</span>
+                        </div>
+                        <div class="past-life-stats">
+                            <span class="past-life-stat">👥 存活 <span class="past-life-stat-val">${aliveCount}/8</span></span>
+                            <span class="past-life-stat">💀 死亡 <span class="past-life-stat-val">${deadCount}人</span></span>
+                        </div>
+                        ${resHtml}
+                        ${deathHtml}
+                        ${lessonHtml}
+                    </div>
+                `;
+            }
+
+            // 末尾加当前世提示
+            html += `
+                <div class="past-life-card past-life-current">
+                    <div class="past-life-card-header">
+                        <span class="past-life-num">🔄 第${currentLife}世（当前）</span>
+                        <span class="past-life-ending unknown">⏳ 进行中</span>
+                    </div>
+                    <div style="font-size:12px; color:rgba(200,210,220,0.5); padding:4px 0;">
+                        这一世的结局尚未揭晓...
+                    </div>
+                </div>
+            `;
+        }
+
+        body.innerHTML = html;
+        overlay.style.display = 'flex';
+
+        // 关闭逻辑
+        const closeFn = () => { overlay.style.display = 'none'; };
+        closeBtn.onclick = closeFn;
+        overlay.onclick = (e) => {
+            if (e.target === overlay) closeFn();
+        };
     }
 
     // ---- 存档 ----
@@ -2653,7 +3148,7 @@ async function switchModel(targetModel) {
         // 0) 先查询Ollama当前已加载的模型
         let loadedModels = [];
         try {
-            const psResp = await fetch('http://localhost:11434/api/ps');
+const psResp = await fetch('/ollama/api/ps');
             if (psResp.ok) {
                 const psData = await psResp.json();
                 loadedModels = (psData.models || []).map(m => m.name);
@@ -2668,7 +3163,7 @@ async function switchModel(targetModel) {
         if (modelsToUnload.length > 0) {
             if (statusEl) statusEl.textContent = `⏳ 卸载旧模型 ...`;
             const unloadPromises = modelsToUnload.map(m =>
-                fetch('http://localhost:11434/api/generate', {
+fetch('/ollama/api/generate', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({ model: m, keep_alive: 0 })
@@ -2684,7 +3179,7 @@ async function switchModel(targetModel) {
         } else {
             // 目标模型不在内存中，需要预热加载
             if (statusEl) statusEl.textContent = `⏳ 正在加载 ${targetModel} ...（首次较慢）`;
-            const resp = await fetch('http://localhost:11434/api/generate', {
+const resp = await fetch('/ollama/api/generate', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({
@@ -2740,6 +3235,90 @@ window.addEventListener('load', () => {
         }
     } catch (e) { /* ignore */ }
 
+    // --- 难度选择器初始化 ---
+    const difficultySelectorEl = document.getElementById('difficulty-selector');
+    const difficultyOptionsEl = document.getElementById('difficulty-options');
+    const difficultyLockedText = document.getElementById('difficulty-locked-text');
+    let selectedDifficultyKey = null;
+
+    // 辅助函数：锁定所有难度卡片
+    function lockDifficultyCards(currentKey) {
+        if (!difficultyOptionsEl) return;
+        difficultyOptionsEl.querySelectorAll('.difficulty-option').forEach(c => {
+            c.classList.add('locked');
+            // 移除之前的🔒标记
+            const oldLock = c.querySelector('.lock-badge');
+            if (oldLock) oldLock.remove();
+            if (c.dataset.key === currentKey) {
+                c.classList.add('current-locked');
+                const lockBadge = document.createElement('span');
+                lockBadge.className = 'lock-badge';
+                lockBadge.textContent = '🔒';
+                lockBadge.style.cssText = 'position:absolute;top:4px;right:6px;font-size:12px;';
+                c.appendChild(lockBadge);
+            }
+        });
+        if (difficultyLockedText) difficultyLockedText.style.display = '';
+    }
+
+    // 辅助函数：解锁所有难度卡片
+    function unlockDifficultyCards() {
+        if (!difficultyOptionsEl) return;
+        difficultyOptionsEl.querySelectorAll('.difficulty-option').forEach(c => {
+            c.classList.remove('locked', 'current-locked');
+            const oldLock = c.querySelector('.lock-badge');
+            if (oldLock) oldLock.remove();
+        });
+        if (difficultyLockedText) difficultyLockedText.style.display = 'none';
+    }
+
+    // 渲染难度卡片
+    if (difficultyOptionsEl) {
+        const levels = getDifficultyList();
+        levels.forEach(level => {
+            const card = document.createElement('div');
+            card.className = 'difficulty-option';
+            card.dataset.key = level.key;
+            card.innerHTML = `
+                <div class="difficulty-stars">${level.stars}</div>
+                <div class="difficulty-name">${level.name}</div>
+                <div class="difficulty-desc">${level.desc}</div>
+                <div class="difficulty-lives">预期 ${level.expectedLives} 通关</div>
+            `;
+            card.addEventListener('click', () => {
+                difficultyOptionsEl.querySelectorAll('.difficulty-option').forEach(c => c.classList.remove('selected'));
+                card.classList.add('selected');
+                selectedDifficultyKey = level.key;
+            });
+            difficultyOptionsEl.appendChild(card);
+        });
+        // 默认选中"简单"
+        const easyCard = difficultyOptionsEl.querySelector('[data-key="easy"]');
+        if (easyCard) {
+            easyCard.classList.add('selected');
+            selectedDifficultyKey = 'easy';
+        }
+    }
+
+    // --- 根据轮回存档状态锁定/解锁难度卡片 ---
+    try {
+        const savedLifeNum = localStorage.getItem('gospel_reincarnation_life_num');
+        const savedLife = savedLifeNum ? parseInt(savedLifeNum, 10) : 0;
+        if (savedLife > 1) {
+            const savedDiff = getDifficulty();
+            lockDifficultyCards(savedDiff.key);
+            // 选中已保存的难度卡片
+            if (difficultyOptionsEl) {
+                difficultyOptionsEl.querySelectorAll('.difficulty-option').forEach(c => c.classList.remove('selected'));
+                const savedCard = difficultyOptionsEl.querySelector(`[data-key="${savedDiff.key}"]`);
+                if (savedCard) {
+                    savedCard.classList.add('selected');
+                    selectedDifficultyKey = savedDiff.key;
+                }
+            }
+        }
+    } catch (e) { /* ignore */ }
+
     // --- 模型选择交互 ---
     const modelOptions = document.querySelectorAll('.model-option');
     modelOptions.forEach(opt => {
@@ -2761,6 +3340,11 @@ window.addEventListener('load', () => {
     async function startGame(mode) {
         if (isStarting) return;
         isStarting = true;
+
+        // 非轮回模式强制使用简单难度
+        if (mode !== 'reincarnation') {
+            setDifficulty('easy');
+        }
 
         // 禁用按钮防止重复点击
         btnAgent.disabled = true;
@@ -2784,7 +3368,8 @@ window.addEventListener('load', () => {
                     try {
                         localStorage.removeItem('gospel_reincarnation');
                         localStorage.removeItem('gospel_reincarnation_life_num');
-                        console.log('[启动] 用户选择从第1世重新开始，轮回数据已清除');
+                        clearDifficulty();
+                        console.log('[启动] 用户选择从第1世重新开始，轮回数据和难度设置已清除');
                     } catch (e) { /* ignore */ }
                 }
             }
@@ -2869,5 +3454,41 @@ window.addEventListener('load', () => {
 
     btnAgent.addEventListener('click', () => startGame('agent'));
     btnDebug.addEventListener('click', () => startGame('debug'));
-    btnReincarnation.addEventListener('click', () => startGame('reincarnation'));
+    // 轮回模式按钮：保存选中难度后直接启动游戏
+    btnReincarnation.addEventListener('click', () => {
+        const lifeNumRaw = localStorage.getItem('gospel_reincarnation_life_num');
+        const lifeNum = lifeNumRaw ? parseInt(lifeNumRaw, 10) : 0;
+        const chkReset = document.getElementById('chk-reset-reincarnation');
+        const isResetting = chkReset && chkReset.checked;
+
+        if (lifeNum > 1 && !isResetting) {
+            // 轮回中途：使用已保存的难度，直接启动
+            startGame('reincarnation');
+        } else {
+            // 新轮回或重置：保存界面上选中的难度后启动
+            if (selectedDifficultyKey) {
+                setDifficulty(selectedDifficultyKey);
+            }
+            startGame('reincarnation');
+        }
+    });
+
+    // "从第1世重新开始"勾选变化时，解锁/锁定难度卡片
+    const chkResetEl = document.getElementById('chk-reset-reincarnation');
+    if (chkResetEl) {
+        chkResetEl.addEventListener('change', () => {
+            const savedLifeNum = localStorage.getItem('gospel_reincarnation_life_num');
+            const savedLife = savedLifeNum ? parseInt(savedLifeNum, 10) : 0;
+            if (chkResetEl.checked) {
+                // 勾选重置：解锁难度卡片，允许重新选择
+                unlockDifficultyCards();
+            } else {
+                // 取消勾选：如果有存档则重新锁定
+                if (savedLife > 1) {
+                    const savedDiff = getDifficulty();
+                    lockDifficultyCards(savedDiff.key);
+                }
+            }
+        });
+    }
 });
