@@ -234,7 +234,6 @@ Detailed design documents are available in the `guide/` directory:
 
 ## 🌟 Inspired By
 
-
 - 🤖 [Stanford Generative Agents](https://github.com/joonspk-research/generative_agents) — LLM-powered autonomous agents
 - 🌾 [Stardew Valley](https://www.stardewvalley.net/) — Pixel art aesthetic & NPC relationships
 - 🎵 [Frostpunk](https://www.frostpunkgame.com/) — Frozen city survival & moral dilemmas
